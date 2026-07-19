@@ -1,0 +1,16 @@
+diff --git a/src/auth.c b/src/auth.c
+--- a/src/auth.c
++++ b/src/auth.c
+@@ -148,5 +148,11 @@ int doauth(struct clientparam * param){
+ 	}
+ 	if(!res){
+-		ret = alwaysauth(param);
++		/*
++		 * handleredirect() has already authenticated and established the
++		 * upstream SOCKS5 UDP control connection.  Calling alwaysauth() again
++		 * would attempt a TCP connect to the UDP relay address in sinsr.
++		 */
++		if(param->operation != UDPASSOC || param->ctrlsocksrv == INVALID_SOCKET)
++			ret = alwaysauth(param);
+ 		if (param->afterauthfilters){
+ 		    FILTER_ACTION action;

@@ -1,0 +1,33 @@
+diff --git a/src/redirect.c b/src/redirect.c
+index 769fc68..f64d4fa 100644
+--- a/src/redirect.c
++++ b/src/redirect.c
+@@ -216,7 +216,7 @@ int clientnegotiate(struct chain * redir, struct clientparam * param, struct soc
+ 				    return 59;
+ 			case 3:
+ 			    if (sockgetlinebuf(param, SERVER, buf, 1, EOF, conf.timeouts[CHAIN_TO]) != 1) return 59;
+-			    len = (unsigned char)buf[4];
++			    len = (unsigned char)buf[0];
+ 			    if (sockgetlinebuf(param, SERVER, buf, len + 2, EOF, conf.timeouts[CHAIN_TO]) != len + 2) return 59;
+ 			    break;
+ 			case 4:
+@@ -409,6 +409,19 @@ int handleredirect(struct clientparam * param, struct ace * acentry){
+ 	    param->ctrlsocksrv = param->remsock;
+ 	    param->remsock = s;
+ 	    param->operation = UDPASSOC;
++	    /*
++	     * The TCP source port used for the parent control connection must not
++	     * leak into the UDP relay bind.  A SOCKS5 UDP association has an
++	     * independent client UDP tuple; request a fresh local UDP port and
++	     * discard the buffered parent reply state before the socket role swap.
++	     */
++	    *SAPORT(&param->sinsl) = 0;
++	    param->srvinbuf = 0;
++	    param->srvoffset = 0;
++	    if(res) {
++		param->srv->so._closesocket(param->sostate, param->ctrlsocksrv);
++		param->ctrlsocksrv = INVALID_SOCKET;
++	    }
+ 	}
+ 	return res;
+ 

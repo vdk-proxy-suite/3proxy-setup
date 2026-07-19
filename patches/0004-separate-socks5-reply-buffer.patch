@@ -1,0 +1,72 @@
+diff --git a/src/redirect.c b/src/redirect.c
+--- a/src/redirect.c
++++ b/src/redirect.c
+@@ -19,6 +19,7 @@ static FILTER_ACTION ssl_parent(struct clientparam * param){
+ 
+ int clientnegotiate(struct chain * redir, struct clientparam * param, struct sockaddr * addr, unsigned char * hostname){
+ 	unsigned char *buf;
++	unsigned char reply[300];
+ 	unsigned char *username;
+ 	int res;
+ 	int len=0;
+@@ -202,28 +203,28 @@ int clientnegotiate(struct chain * redir, struct clientparam * param, struct soc
+ 			}
+ 			param->statssrv64+=len;
+ 			param->nwrites++;
+-			if(sockgetlinebuf(param, SERVER, buf, 4, EOF, conf.timeouts[CHAIN_TO]) != 4){
++			if(sockgetlinebuf(param, SERVER, reply, 4, EOF, conf.timeouts[CHAIN_TO]) != 4){
+ 				return 57;
+ 			}
+-			if(buf[0] != 5) {
++			if(reply[0] != 5) {
+ 				return 53;
+ 			}
+-			if(buf[1] != 0) {
+-				return 60 + (buf[1] % 10);
++			if(reply[1] != 0) {
++				return 60 + (reply[1] % 10);
+ 			}
+-			atyp = buf[3];
+-			switch (buf[3]) {
++			atyp = reply[3];
++			switch (reply[3]) {
+ 			case 1:
+-			    if (redir->type == R_SOCKS5B ||  sockgetlinebuf(param, SERVER, buf, 6, EOF, conf.timeouts[CHAIN_TO]) == 6)
++			    if (redir->type == R_SOCKS5B || sockgetlinebuf(param, SERVER, reply + 4, 6, EOF, conf.timeouts[CHAIN_TO]) == 6)
+ 				    break;
+ 			    return 59;
+ 			case 3:
+-			    if (sockgetlinebuf(param, SERVER, buf, 1, EOF, conf.timeouts[CHAIN_TO]) != 1) return 59;
+-			    len = (unsigned char)buf[0];
+-			    if (sockgetlinebuf(param, SERVER, buf, len + 2, EOF, conf.timeouts[CHAIN_TO]) != len + 2) return 59;
++			    if (sockgetlinebuf(param, SERVER, reply + 4, 1, EOF, conf.timeouts[CHAIN_TO]) != 1) return 59;
++			    len = (unsigned char)reply[4];
++			    if (len > 255 || sockgetlinebuf(param, SERVER, reply + 5, len + 2, EOF, conf.timeouts[CHAIN_TO]) != len + 2) return 59;
+ 			    break;
+ 			case 4:
+-			    if (sockgetlinebuf(param, SERVER, buf, 18, EOF, conf.timeouts[CHAIN_TO]) == 18)
++			    if (sockgetlinebuf(param, SERVER, reply + 4, 18, EOF, conf.timeouts[CHAIN_TO]) == 18)
+ 				    break;
+ 			    return 59;
+ 			default:
+@@ -234,16 +235,16 @@ int clientnegotiate(struct chain * redir, struct clientparam * param, struct soc
+ 				memset(relay, 0, sizeof(*relay));
+ 				if (atyp == 1) {
+ 					*SAFAMILY(relay) = AF_INET;
+-					memcpy(SAADDR(relay), buf, 4);
+-					memcpy(SAPORT(relay), buf + 4, 2);
++					memcpy(SAADDR(relay), reply + 4, 4);
++					memcpy(SAPORT(relay), reply + 8, 2);
+ 					if (param->udp_nhops == 0) {
+ 					    param->sinsr = *relay;
+ 					}
+ 					param->udp_nhops++;
+ 				} else if (atyp == 4) {
+ 					*SAFAMILY(relay) = AF_INET6;
+-					memcpy(SAADDR(relay), buf, 16);
+-					memcpy(SAPORT(relay), buf + 16, 2);
++					memcpy(SAADDR(relay), reply + 4, 16);
++					memcpy(SAPORT(relay), reply + 20, 2);
+ 					if (param->udp_nhops == 0) param->sinsr = *relay;
+ 					param->udp_nhops++;
+ 				}

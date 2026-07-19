@@ -1,0 +1,22 @@
+# Runtime configuration and secrets
+config.yaml
+.env
+.env.*
+!.env.example
+
+# Generated artifacts and local environments
+*.zip
+*.log
+*.pcap
+*.pcapng
+healthchecks/
+venv/
+.venv/
+__pycache__/
+*.py[cod]
+
+# Editor and OS metadata
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
