@@ -26,7 +26,12 @@ def recv_exact(sock: socket.socket, size: int) -> bytes:
     return bytes(data)
 
 
-def socks_auth(sock: socket.socket, user: str, password: str) -> None:
+def socks_auth(sock: socket.socket, user: str | None, password: str | None) -> None:
+    if user is None:
+        sock.sendall(b"\x05\x01\x00")
+        if recv_exact(sock, 2) != b"\x05\x00":
+            raise RuntimeError("SOCKS5 no-authentication method was not selected")
+        return
     sock.sendall(b"\x05\x01\x02")
     if recv_exact(sock, 2) != b"\x05\x02":
         raise RuntimeError("SOCKS5 username/password authentication was not selected")
@@ -68,7 +73,7 @@ def read_http_response(sock: socket.socket) -> tuple[str, bytes]:
     return status, body
 
 
-def socks_tcp(proxy: str, port: int, user: str, password: str, target: str, target_port: int, timeout: float) -> str:
+def socks_tcp(proxy: str, port: int, user: str | None, password: str | None, target: str, target_port: int, timeout: float) -> str:
     with socket.create_connection((proxy, port), timeout=timeout) as sock:
         sock.settimeout(timeout)
         socks_auth(sock, user, password)
@@ -82,11 +87,17 @@ def socks_tcp(proxy: str, port: int, user: str, password: str, target: str, targ
     return body.decode(errors="replace")
 
 
-def http_get(proxy: str, port: int, user: str, password: str, target: str, target_port: int, timeout: float) -> str:
+def proxy_authorization(user: str | None, password: str | None) -> str:
+    if user is None:
+        return ""
     token = base64.b64encode(f"{user}:{password}".encode()).decode()
+    return f"Proxy-Authorization: Basic {token}\r\n"
+
+
+def http_get(proxy: str, port: int, user: str | None, password: str | None, target: str, target_port: int, timeout: float) -> str:
     request = (
         f"GET http://{target}:{target_port}/ HTTP/1.1\r\n"
-        f"Host: {target}\r\nProxy-Authorization: Basic {token}\r\nConnection: close\r\n\r\n"
+        f"Host: {target}\r\n{proxy_authorization(user, password)}Connection: close\r\n\r\n"
     ).encode()
     with socket.create_connection((proxy, port), timeout=timeout) as sock:
         sock.settimeout(timeout)
@@ -97,11 +108,10 @@ def http_get(proxy: str, port: int, user: str, password: str, target: str, targe
     return body.decode(errors="replace")
 
 
-def http_connect(proxy: str, port: int, user: str, password: str, target: str, target_port: int, timeout: float) -> str:
-    token = base64.b64encode(f"{user}:{password}".encode()).decode()
+def http_connect(proxy: str, port: int, user: str | None, password: str | None, target: str, target_port: int, timeout: float) -> str:
     request = (
         f"CONNECT {target}:{target_port} HTTP/1.1\r\nHost: {target}:{target_port}\r\n"
-        f"Proxy-Authorization: Basic {token}\r\n\r\n"
+        f"{proxy_authorization(user, password)}\r\n"
     ).encode()
     with socket.create_connection((proxy, port), timeout=timeout) as sock:
         sock.settimeout(timeout)
@@ -147,7 +157,7 @@ def decode_socks_udp(packet: bytes) -> tuple[bytes, str, int]:
 
 
 def socks_udp_exchange(
-    proxy: str, port: int, user: str, password: str, target: str, target_port: int, payload: bytes, timeout: float
+    proxy: str, port: int, user: str | None, password: str | None, target: str, target_port: int, payload: bytes, timeout: float
 ) -> tuple[bytes, dict[str, Any]]:
     control = socket.create_connection((proxy, port), timeout=timeout)
     try:
@@ -178,7 +188,7 @@ def socks_udp_exchange(
         control.close()
 
 
-def dns_probe(proxy: str, port: int, user: str, password: str, dns_host: str, dns_port: int, timeout: float) -> str:
+def dns_probe(proxy: str, port: int, user: str | None, password: str | None, dns_host: str, dns_port: int, timeout: float) -> str:
     txid = int.from_bytes(os.urandom(2), "big")
     labels = b"".join(bytes([len(part)]) + part for part in b"example.com".split(b".")) + b"\x00"
     query = struct.pack("!HHHHHH", txid, 0x0100, 1, 0, 0, 0) + labels + struct.pack("!HH", 1, 1)
@@ -214,7 +224,7 @@ def parse_stun_mapped(response: bytes, txid: bytes) -> str:
 
 
 def stun_probe(
-    proxy: str, port: int, user: str, password: str, stun_servers: list[dict[str, Any]], timeout: float
+    proxy: str, port: int, user: str | None, password: str | None, stun_servers: list[dict[str, Any]], timeout: float
 ) -> str:
     errors = []
     for server in stun_servers:
@@ -283,8 +293,10 @@ def main() -> int:
     config = load_config(args.config)
     timeout = args.timeout or float(config["probes"]["timeout_seconds"])
     public_ip = config["server"]["public_ip"]
-    local_user = config["local_auth"]["username"]
-    local_password = config["local_auth"]["password"]
+    access_mode = config.get("access", {}).get("mode", "strong")
+    local_auth = config.get("local_auth", {})
+    local_user = local_auth.get("username") if access_mode == "strong" else None
+    local_password = local_auth.get("password") if access_mode == "strong" else None
     http_host = config["probes"]["http_host"]
     http_port = int(config["probes"]["http_port"])
     dns_host = config["probes"]["dns_server"]

@@ -22,6 +22,11 @@ EXPECTED_LISTENERS = {
     "http_via_http": ("http", "http_primary", {"tcp"}),
 }
 
+SUPPORTED_UPSTREAMS = {
+    "socks_primary": ("socks5", {"tcp", "udp"}),
+    "http_primary": ("http", {"tcp"}),
+}
+
 
 def load_config(path: Path) -> dict[str, Any]:
     with path.open("r", encoding="utf-8") as stream:
@@ -83,19 +88,43 @@ def validate(data: dict[str, Any]) -> None:
     if not isinstance(logging.get("compress", True), bool):
         raise ValueError("logging.compress must be boolean")
 
-    local = data.get("local_auth")
-    if not isinstance(local, dict):
-        raise ValueError("local_auth must be a mapping")
-    safe_token(local.get("username"), "local_auth.username")
-    safe_token(local.get("password"), "local_auth.password")
+    access = data.get("access", {})
+    if not isinstance(access, dict):
+        raise ValueError("access must be a mapping")
+    mode = access.get("mode", "strong")
+    if mode not in {"strong", "iponly"}:
+        raise ValueError("access.mode must be strong or iponly")
+    allowed_client_cidrs = access.get("allowed_client_cidrs", [])
+    if not isinstance(allowed_client_cidrs, list):
+        raise ValueError("access.allowed_client_cidrs must be a list")
+    if mode == "iponly" and not allowed_client_cidrs:
+        raise ValueError("iponly access requires at least one allowed client CIDR")
+    for index, value in enumerate(allowed_client_cidrs):
+        network = ipaddress.ip_network(str(value), strict=False)
+        if network.version != 4:
+            raise ValueError(f"access.allowed_client_cidrs[{index}] must be IPv4")
+        if network.prefixlen == 0:
+            raise ValueError("iponly access must not allow an open /0 network")
 
-    upstreams = data.get("upstreams")
-    if not isinstance(upstreams, dict) or set(upstreams) != {"socks_primary", "http_primary"}:
-        raise ValueError("upstreams must define socks_primary and http_primary")
+    local = data.get("local_auth")
+    if mode == "strong":
+        if not isinstance(local, dict):
+            raise ValueError("local_auth must be a mapping in strong mode")
+        safe_token(local.get("username"), "local_auth.username")
+        safe_token(local.get("password"), "local_auth.password")
+    elif local is not None and not isinstance(local, dict):
+        raise ValueError("local_auth must be a mapping when provided")
+
+    upstreams = data.get("upstreams", {})
+    if not isinstance(upstreams, dict):
+        raise ValueError("upstreams must be a mapping")
+    unknown_upstreams = set(upstreams) - set(SUPPORTED_UPSTREAMS)
+    if unknown_upstreams:
+        raise ValueError(f"unsupported upstreams: {sorted(unknown_upstreams)}")
     for name, upstream in upstreams.items():
         if not isinstance(upstream, dict):
             raise ValueError(f"upstreams.{name} must be a mapping")
-        expected_type = "socks5" if name == "socks_primary" else "http"
+        expected_type, expected_caps = SUPPORTED_UPSTREAMS[name]
         if upstream.get("type") != expected_type:
             raise ValueError(f"upstreams.{name}.type must be {expected_type}")
         safe_token(upstream.get("host"), f"upstreams.{name}.host", colon=False)
@@ -106,13 +135,14 @@ def validate(data: dict[str, Any]) -> None:
             raise ValueError(f"upstreams.{name}.port is invalid")
         ipaddress.ip_address(str(upstream.get("expected_egress_ip")))
         capabilities = set(upstream.get("capabilities", []))
-        expected_caps = {"tcp", "udp"} if expected_type == "socks5" else {"tcp"}
         if capabilities != expected_caps:
             raise ValueError(f"upstreams.{name}.capabilities must be {sorted(expected_caps)}")
 
     listeners = data.get("listeners")
-    if not isinstance(listeners, list) or len(listeners) != 6:
-        raise ValueError("listeners must contain exactly six entries")
+    if not isinstance(listeners, list) or not listeners:
+        raise ValueError("listeners must contain at least one entry")
+    if len(listeners) > len(EXPECTED_LISTENERS):
+        raise ValueError("listeners contains more entries than the supported topology")
     by_id: dict[str, dict[str, Any]] = {}
     ports: set[int] = set()
     for item in listeners:
@@ -126,14 +156,17 @@ def validate(data: dict[str, Any]) -> None:
         if not isinstance(port, int) or not 1 <= port <= 65535 or port in ports:
             raise ValueError(f"invalid or duplicate listener port: {port}")
         ports.add(port)
-    if set(by_id) != set(EXPECTED_LISTENERS):
-        raise ValueError("listener ids do not match the supported six-endpoint topology")
-    for listener_id, (protocol, parent, capabilities) in EXPECTED_LISTENERS.items():
-        item = by_id[listener_id]
+    unknown_listeners = set(by_id) - set(EXPECTED_LISTENERS)
+    if unknown_listeners:
+        raise ValueError(f"unsupported listener ids: {sorted(unknown_listeners)}")
+    for listener_id, item in by_id.items():
+        protocol, parent, capabilities = EXPECTED_LISTENERS[listener_id]
         if item.get("protocol") != protocol or item.get("parent") != parent:
             raise ValueError(f"listener {listener_id} has an invalid protocol/parent mapping")
         if set(item.get("capabilities", [])) != capabilities:
             raise ValueError(f"listener {listener_id} has invalid capabilities")
+        if parent != "direct" and parent not in upstreams:
+            raise ValueError(f"listener {listener_id} references undefined upstream {parent}")
 
     probes = data.get("probes")
     if not isinstance(probes, dict):
@@ -154,8 +187,11 @@ def parent_line(data: dict[str, Any], name: str) -> str:
 
 
 def render_3proxy(data: dict[str, Any]) -> str:
-    user = data["local_auth"]["username"]
-    password = data["local_auth"]["password"]
+    access = data.get("access", {})
+    mode = access.get("mode", "strong")
+    local_auth = data.get("local_auth", {})
+    user = local_auth.get("username")
+    password = local_auth.get("password")
     listen_ip = data["server"]["listen_ip"]
     public_ip = data["server"]["public_ip"]
     logging = data.get("logging", {})
@@ -171,11 +207,17 @@ def render_3proxy(data: dict[str, Any]) -> str:
         'logformat "-|+_Gv1|%t|%.|%D|%N|%p|%E|%U|%C|%c|%R|%r|%Q|%q|%n|%O|%I|%h|%T"',
         "timeouts 1 5 30 60 180 1800 15 60 15 5",
         "maxconn 1000",
-        f"users {user}:CL:{password}",
+        *([f"users {user}:CL:{password}"] if mode == "strong" else []),
         "",
     ]
     for listener in sorted(data["listeners"], key=lambda item: item["port"]):
-        lines.extend([f"# {listener['id']}", "auth strong", f"allow {user}"])
+        lines.append(f"# {listener['id']}")
+        if mode == "strong":
+            lines.extend(["auth strong", f"allow {user}"])
+        else:
+            lines.append("auth iponly")
+            lines.extend(f"allow * {cidr}" for cidr in access["allowed_client_cidrs"])
+            lines.append("deny *")
         if listener["parent"] != "direct":
             lines.append(parent_line(data, listener["parent"]))
         if listener["protocol"] == "socks5":

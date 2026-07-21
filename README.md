@@ -1,4 +1,4 @@
-# Standalone 3proxy setup 1.1.1
+# Standalone 3proxy setup 1.2.0
 
 Пакет устанавливает 3proxy 0.9.7 из исходников, применяет патчи UDP-over-SOCKS,
 создаёт шесть listeners и запускает локальный health-check. Рассчитан на
@@ -65,6 +65,17 @@ venv/bin/python tools/healthcheck.py --scope e2e --config config.yaml
 
 `config.yaml` содержит секреты: храните его с правами `600` и не добавляйте в
 публичные репозитории или общедоступные архивы.
+
+## Passwordless direct profile
+
+Версия 1.2.0 поддерживает ограниченный по source IPv4 режим без пароля. Возьмите
+`config.iponly.example.yaml`, задайте `access.allowed_client_cidrs` и оставьте
+только необходимые direct listeners. В режиме `iponly` установщик требует
+непустой allowlist, запрещает `/0` и завершает каждый ACL правилом `deny *`.
+`local_auth` и `upstreams` для полностью direct-профиля не требуются.
+
+Боевые профили именуйте по SSH-алиасу, например
+`config.yc-vm-0426.yaml`, и всегда передавайте через `--config`.
 
 ## Полная очистка
 

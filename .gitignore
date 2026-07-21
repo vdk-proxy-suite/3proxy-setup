@@ -1,5 +1,8 @@
 # Runtime configuration and secrets
-config.yaml
+AGENTS.md
+config*.yaml
+!config.example.yaml
+!config.iponly.example.yaml
 .env
 .env.*
 !.env.example

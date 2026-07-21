@@ -15,6 +15,9 @@ logging:
   keep_files: 14
   compress: true
 
+access:
+  mode: "strong"
+
 local_auth:
   username: "CHANGE_ME"
   password: "CHANGE_ME"

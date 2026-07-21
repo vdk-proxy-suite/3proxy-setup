@@ -1,0 +1,47 @@
+install:
+  version: "0.9.7"
+  source_url: "https://github.com/3proxy/3proxy/archive/refs/tags/0.9.7.tar.gz"
+  sha256: "efe862ef8b7c0ddf7b1c45d6b5d72f0b7cd0a3c54447419c7f1bd2239a06fc30"
+
+server:
+  public_ip: "203.0.113.10"
+  listen_ip: "0.0.0.0"
+  udp_client_cidr: "198.51.100.25/32"
+  manage_ufw: false
+
+logging:
+  format: "monitor_v1"
+  rotation: "daily"
+  keep_files: 14
+  compress: true
+
+access:
+  mode: "iponly"
+  allowed_client_cidrs:
+    - "198.51.100.25/32"
+
+upstreams: {}
+
+listeners:
+  - id: "socks_direct"
+    protocol: "socks5"
+    port: 1080
+    parent: "direct"
+    capabilities: [tcp, udp]
+  - id: "http_direct"
+    protocol: "http"
+    port: 8080
+    parent: "direct"
+    capabilities: [tcp]
+
+probes:
+  timeout_seconds: 8
+  http_host: "api.ipify.org"
+  http_port: 80
+  dns_server: "1.1.1.1"
+  dns_port: 53
+  stun_servers:
+    - host: "stun.l.google.com"
+      port: 19302
+    - host: "stun.cloudflare.com"
+      port: 3478
