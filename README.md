@@ -1,9 +1,17 @@
-# Standalone 3proxy setup 2.1.0
+# Standalone 3proxy setup 2.1.1
 
 Пакет устанавливает 3proxy 1.0.0 из проверенного tag-архива, собирает основной
 binary с обязательным OpenSSL client support, создаёт выбранные listeners и
 запускает health-check. Рассчитан на Ubuntu/Debian с `apt-get`, `systemd` и
 доступом в интернет.
+
+Версия 2.1.1 исправляет build-time проверки без изменения YAML или runtime
+топологии. Patchset digest теперь зависит только от имён и содержимого патчей,
+а не от абсолютного staging-пути. Обязательный combined OpenSSL smoke использует
+одноразовый TLS CONNECT parent: он проверяет SNI от 3proxy, принимает только
+ожидаемый CONNECT authority и возвращает `200` через тот же TLS-канал. Это
+заменяет недостоверный поиск request line в выводе `openssl s_server -www`,
+который эту строку не журналирует.
 
 Версия 2.1.0 добавляет настоящий HTTPS forward-proxy listener: соединение
 клиент → 3proxy начинается с проверяемого TLS, а внутри него работает обычный
@@ -39,7 +47,9 @@ sha256:  35b07de1046f3aaeac4a7085101b7e5c453efa3527cbdc42a84690366c7ecfa8
 Сборка выполняется CMake с `3PROXY_USE_OPENSSL=ON` и
 `3PROXY_USE_WOLFSSL=OFF`. Отсутствие OpenSSL останавливает установку. Перед
 заменой установленного binary проверяются CMake flags, dynamic dependencies и
-runtime-разбор TLS client directives.
+реальный combined runtime-маршрут TLS client → HTTPS listener → 3proxy → HTTPS
+parent. На входе проверяются CA и IP SAN, на выходе — CA и ожидаемый DNS SNI;
+parent дополнительно валидирует сам CONNECT request.
 
 ## Быстрый запуск
 
@@ -67,7 +77,7 @@ sudo ./setup3proxy.sh reconfigure
 `config.example.yaml`. Новые `tls`, `https_primary` и HTTPS listeners не нужны,
 пока используется только прежняя direct/SOCKS5/HTTP topology.
 
-При обновлении с 2.0.x на 2.1.0 пересборка binary не требуется: server-side TLS
+При обновлении с 2.0.x на 2.1.x пересборка binary не требуется: server-side TLS
 уже присутствует в закреплённой OpenSSL-сборке 3proxy 1.0.0. Если новый HTTPS
 listener не добавляется, достаточно `reconfigure`, а старые YAML и ID вроде
 `socks_via_https` остаются валидными. При первом добавлении HTTPS listener
@@ -76,6 +86,12 @@ listener не добавляется, достаточно `reconfigure`, а с�
 `openssl` нет, используйте `all`, который устанавливает зависимость и повторно
 проверяет одновременно server-side и client-side TLS. Приватные `config*.yaml`,
 сертификаты и ключи установщик и release-архив не включают.
+
+Переход с 2.1.0 на 2.1.1 не требует изменений конфигурации. Для уже проверенного
+OpenSSL binary допустим штатный `reconfigure`. Первый последующий запуск `all`
+пересоберёт binary один раз, потому что прежний manifest содержал зависящий от
+пути patchset digest; новый manifest остаётся одинаковым при переносе setup в
+другой каталог.
 
 В `config.yaml` замените:
 

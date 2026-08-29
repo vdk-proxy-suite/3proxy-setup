@@ -22,7 +22,7 @@ class BuildArchiveTests(unittest.TestCase):
         ".gitignore": "*.zip\n*.sha256\n",
         ".env.example": "SAFE_PLACEHOLDER=change-me\n",
         "README.md": "# Fixture package\n",
-        "VERSION": "2.1.0\n",
+        "VERSION": "2.1.1\n",
         "clean3proxy.sh": "#!/bin/sh\n",
         "config.example.yaml": "access:\n  mode: strong\n",
         "config.iponly.example.yaml": "access:\n  mode: iponly\n",
@@ -40,8 +40,10 @@ class BuildArchiveTests(unittest.TestCase):
         "steps/02-configure.sh": "#!/bin/sh\n",
         "steps/03-start-healthcheck.sh": "#!/bin/sh\n",
         "tests/fixture.sh": "#!/bin/sh\n",
+        "tests/test_build_checks.py": "def test_fixture():\n    pass\n",
         "tests/test_config.py": "def test_fixture():\n    pass\n",
         "tools/build_archive.py": "#!/usr/bin/env python3\n",
+        "tools/build_checks.py": "#!/usr/bin/env python3\n",
         "tools/certificates.py": "#!/usr/bin/env python3\n",
         "tools/config.py": "#!/usr/bin/env python3\n",
         "tools/healthcheck.py": "#!/usr/bin/env python3\n",
@@ -84,6 +86,7 @@ class BuildArchiveTests(unittest.TestCase):
         "steps/02-configure.sh",
         "steps/03-start-healthcheck.sh",
         "tools/build_archive.py",
+        "tools/build_checks.py",
         "tools/certificates.py",
         "tools/config.py",
         "tools/healthcheck.py",
@@ -100,9 +103,9 @@ class BuildArchiveTests(unittest.TestCase):
         for relative, contents in self.EXCLUDED_FILES.items():
             self.write_fixture(relative, contents)
 
-        self.output = self.source / "3proxy-setup-2.1.0.zip"
+        self.output = self.source / "3proxy-setup-2.1.1.zip"
         self.output.write_bytes(b"pre-existing release archive")
-        self.checksum = self.source / "3proxy-setup-2.1.0.zip.sha256"
+        self.checksum = self.source / "3proxy-setup-2.1.1.zip.sha256"
         self.checksum.write_text("pre-existing checksum\n", encoding="utf-8")
         self.write_fixture("previous-release.zip", "pre-existing zip\n")
         self.write_fixture("previous-release.sha256", "pre-existing checksum\n")

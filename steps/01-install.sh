@@ -7,7 +7,8 @@ parse_config_arg "$@"
 version="$(yaml_get install.version)"
 source_url="$(yaml_get install.source_url)"
 source_sha="$(yaml_get install.sha256)"
-patch_sha="$(sha256sum "$SETUP_ROOT"/patches/*.patch | sha256sum | awk '{print $1}')"
+patch_sha="$(python3 "$SETUP_ROOT/tools/build_checks.py" patchset-sha \
+  --directory "$SETUP_ROOT/patches")"
 build_profile="cmake-openssl"
 
 if [[ "${FORCE_REBUILD:-0}" != "1" && -x /usr/local/bin/3proxy && -f /usr/local/share/3proxy-build/manifest.json ]]; then
@@ -27,6 +28,7 @@ apt-get install -y --no-install-recommends build-essential cmake curl ca-certifi
 work="$(mktemp -d /tmp/3proxy-build.XXXXXX)"
 feature_pid=""
 feature_parent_pid=""
+feature_parent_rc=1
 cleanup() {
   [[ -z "$feature_pid" ]] || kill "$feature_pid" 2>/dev/null || true
   [[ -z "$feature_parent_pid" ]] || kill "$feature_parent_pid" 2>/dev/null || true
@@ -85,8 +87,12 @@ feature_cert="$work/tls-feature-check.crt"
 feature_key="$work/tls-feature-check.key"
 feature_request="$work/tls-feature-check.csr"
 feature_ext="$work/tls-feature-check.cnf"
+feature_authority="127.0.0.1:443"
 feature_port="$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()')"
 feature_parent_port="$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()')"
+while [[ "$feature_parent_port" == "$feature_port" ]]; do
+  feature_parent_port="$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()')"
+done
 openssl req -x509 -newkey rsa:2048 -nodes -sha256 -days 2 \
   -keyout "$feature_ca_key" -out "$feature_ca_cert" -subj '/CN=3proxy-feature-check-ca' \
   -addext 'basicConstraints = critical,CA:TRUE' \
@@ -123,15 +129,26 @@ printf '%s\n' \
   'ssl_noserv' \
   'ssl_nocli' \
   'end' > "$feature_cfg"
-openssl s_server -accept "127.0.0.1:$feature_parent_port" \
-  -cert "$feature_cert" -key "$feature_key" -www -state \
-  < /dev/null > "$feature_parent_log" 2>&1 &
+python3 "$SETUP_ROOT/tools/build_checks.py" tls-connect-parent \
+  --listen-host 127.0.0.1 --port "$feature_parent_port" \
+  --cert "$feature_cert" --key "$feature_key" \
+  --expected-sni feature-check.invalid \
+  --expected-authority "$feature_authority" --timeout 8 \
+  > "$feature_parent_log" 2>&1 &
 feature_parent_pid=$!
 for _ in {1..50}; do
   kill -0 "$feature_parent_pid" 2>/dev/null || break
-  ss -H -ltn "sport = :$feature_parent_port" | grep -q LISTEN && break
+  grep -Fq "PROBE_READY host=127.0.0.1 port=$feature_parent_port" \
+    "$feature_parent_log" && break
   sleep 0.05
 done
+if ! kill -0 "$feature_parent_pid" 2>/dev/null \
+    || ! grep -Fq "PROBE_READY host=127.0.0.1 port=$feature_parent_port" \
+      "$feature_parent_log"; then
+  cat "$feature_parent_log" >&2
+  echo "TLS CONNECT parent probe failed to become ready" >&2
+  exit 1
+fi
 "$binary" "$feature_cfg" > "$feature_log" 2>&1 &
 feature_pid=$!
 for _ in {1..50}; do
@@ -143,19 +160,24 @@ for _ in {1..50}; do
   fi
   sleep 0.05
 done
-printf 'CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n' \
+printf 'CONNECT %s HTTP/1.1\r\nHost: %s\r\n\r\n' \
+    "$feature_authority" "$feature_authority" \
   | timeout 3s openssl s_client -quiet -connect "127.0.0.1:$feature_port" \
       -CAfile "$feature_ca_cert" -verify_ip 127.0.0.1 -verify_return_error \
       >> "$feature_tls_log" 2>&1 || true
-for _ in {1..50}; do
-  grep -Fq 'CONNECT example.com:443 HTTP/1.1' "$feature_parent_log" && break
-  sleep 0.05
-done
+if wait "$feature_parent_pid"; then
+  feature_parent_rc=0
+else
+  feature_parent_rc=$?
+fi
+feature_parent_pid=""
 if ! kill -0 "$feature_pid" 2>/dev/null \
-    || ! kill -0 "$feature_parent_pid" 2>/dev/null \
+    || (( feature_parent_rc != 0 )) \
     || ! grep -Fq 'Verify return code: 0 (ok)' "$feature_tls_log" \
-    || ! grep -Fq 'SSL_accept:' "$feature_parent_log" \
-    || ! grep -Fq 'CONNECT example.com:443 HTTP/1.1' "$feature_parent_log" \
+    || ! grep -Eq '^HTTP/1\.[01] 200 ' "$feature_tls_log" \
+    || ! grep -Fq \
+      "PROBE_OK sni=feature-check.invalid authority=$feature_authority " \
+      "$feature_parent_log" \
     || grep -Eq 'Unknown command:|Command: .* failed|failed to (set|create|read|use)' "$feature_log"; then
   cat "$feature_log" >&2
   cat "$feature_tls_log" >&2
@@ -166,9 +188,6 @@ fi
 kill "$feature_pid" 2>/dev/null || true
 wait "$feature_pid" 2>/dev/null || true
 feature_pid=""
-kill "$feature_parent_pid" 2>/dev/null || true
-wait "$feature_parent_pid" 2>/dev/null || true
-feature_parent_pid=""
 install -D -m 755 "$binary" /usr/local/bin/3proxy.new
 mv -f /usr/local/bin/3proxy.new /usr/local/bin/3proxy
 
