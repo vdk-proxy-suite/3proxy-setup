@@ -3,6 +3,7 @@ AGENTS.md
 config*.yaml
 !config.example.yaml
 !config.iponly.example.yaml
+!config.telemt-bridge.example.yaml
 .env
 .env.*
 !.env.example

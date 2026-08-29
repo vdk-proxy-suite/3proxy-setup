@@ -37,7 +37,7 @@ diff --git a/src/redirect.c b/src/redirect.c
  			    return 59;
  			case 3:
 -			    if (sockgetlinebuf(param, SERVER, buf, 1, EOF, conf.timeouts[CHAIN_TO]) != 1) return 59;
--			    len = (unsigned char)buf[0];
+-			    len = (unsigned char)buf[4];
 -			    if (sockgetlinebuf(param, SERVER, buf, len + 2, EOF, conf.timeouts[CHAIN_TO]) != len + 2) return 59;
 +			    if (sockgetlinebuf(param, SERVER, reply + 4, 1, EOF, conf.timeouts[CHAIN_TO]) != 1) return 59;
 +			    len = (unsigned char)reply[4];

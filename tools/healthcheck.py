@@ -7,6 +7,7 @@ import ipaddress
 import json
 import os
 import socket
+import ssl
 import struct
 import sys
 import time
@@ -94,13 +95,48 @@ def proxy_authorization(user: str | None, password: str | None) -> str:
     return f"Proxy-Authorization: Basic {token}\r\n"
 
 
-def http_get(proxy: str, port: int, user: str | None, password: str | None, target: str, target_port: int, timeout: float) -> str:
+def open_proxy_connection(
+    proxy: str,
+    port: int,
+    timeout: float,
+    *,
+    tls_server_name: str | None = None,
+    ca_file: str | None = None,
+) -> socket.socket:
+    raw = socket.create_connection((proxy, port), timeout=timeout)
+    raw.settimeout(timeout)
+    if tls_server_name is None:
+        return raw
+    try:
+        context = ssl.create_default_context(cafile=ca_file)
+        context.minimum_version = ssl.TLSVersion.TLSv1_2
+        context.check_hostname = True
+        context.verify_mode = ssl.CERT_REQUIRED
+        return context.wrap_socket(raw, server_hostname=tls_server_name)
+    except Exception:
+        raw.close()
+        raise
+
+
+def http_get(
+    proxy: str,
+    port: int,
+    user: str | None,
+    password: str | None,
+    target: str,
+    target_port: int,
+    timeout: float,
+    *,
+    tls_server_name: str | None = None,
+    ca_file: str | None = None,
+) -> str:
     request = (
         f"GET http://{target}:{target_port}/ HTTP/1.1\r\n"
         f"Host: {target}\r\n{proxy_authorization(user, password)}Connection: close\r\n\r\n"
     ).encode()
-    with socket.create_connection((proxy, port), timeout=timeout) as sock:
-        sock.settimeout(timeout)
+    with open_proxy_connection(
+        proxy, port, timeout, tls_server_name=tls_server_name, ca_file=ca_file
+    ) as sock:
         sock.sendall(request)
         status, body = read_http_response(sock)
     if " 200 " not in status:
@@ -108,17 +144,34 @@ def http_get(proxy: str, port: int, user: str | None, password: str | None, targ
     return body.decode(errors="replace")
 
 
-def http_connect(proxy: str, port: int, user: str | None, password: str | None, target: str, target_port: int, timeout: float) -> str:
+def http_connect(
+    proxy: str,
+    port: int,
+    user: str | None,
+    password: str | None,
+    target: str,
+    target_port: int,
+    timeout: float,
+    *,
+    tls_server_name: str | None = None,
+    ca_file: str | None = None,
+) -> str:
     request = (
         f"CONNECT {target}:{target_port} HTTP/1.1\r\nHost: {target}:{target_port}\r\n"
         f"{proxy_authorization(user, password)}\r\n"
     ).encode()
-    with socket.create_connection((proxy, port), timeout=timeout) as sock:
-        sock.settimeout(timeout)
+    with open_proxy_connection(
+        proxy, port, timeout, tls_server_name=tls_server_name, ca_file=ca_file
+    ) as sock:
         sock.sendall(request)
         header = bytearray()
         while b"\r\n\r\n" not in header:
-            header.extend(sock.recv(4096))
+            chunk = sock.recv(4096)
+            if not chunk:
+                raise ConnectionError("proxy closed before completing the CONNECT response")
+            header.extend(chunk)
+            if len(header) > 65536:
+                raise RuntimeError("CONNECT response headers exceed 64 KiB")
         status = bytes(header).split(b"\r\n", 1)[0].decode(errors="replace")
         if " 200 " not in status:
             raise RuntimeError(f"CONNECT response: {status}")
@@ -282,6 +335,26 @@ def add_na(results: list[dict[str, Any]], endpoint: str, check: str, reason: str
     results.append({"endpoint": endpoint, "check": check, "required": False, "status": "N/A", "detail": reason})
 
 
+def listener_probe_host(listener: dict[str, Any], scope: str, public_ip: str, default_listen_ip: str) -> str | None:
+    bind_ip = str(listener.get("listen_ip", default_listen_ip))
+    if ipaddress.ip_address(bind_ip).is_loopback:
+        return bind_ip if scope == "vm" else None
+    return public_ip
+
+
+def add_listener_na(results: list[dict[str, Any]], listener: dict[str, Any]) -> None:
+    endpoint = listener["id"]
+    reason = "local-only listener is reachable only from the VM"
+    if listener["protocol"] == "socks5":
+        add_na(results, endpoint, "tcp", reason)
+        add_na(results, endpoint, "udp_dns" if "udp" in listener["capabilities"] else "udp", reason)
+        if "udp" in listener["capabilities"]:
+            add_na(results, endpoint, "udp_stun", reason)
+    else:
+        add_na(results, endpoint, "http_get", reason)
+        add_na(results, endpoint, "http_connect", reason)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=Path, required=True)
@@ -293,6 +366,7 @@ def main() -> int:
     config = load_config(args.config)
     timeout = args.timeout or float(config["probes"]["timeout_seconds"])
     public_ip = config["server"]["public_ip"]
+    default_listen_ip = config["server"]["listen_ip"]
     access_mode = config.get("access", {}).get("mode", "strong")
     local_auth = config.get("local_auth", {})
     local_user = local_auth.get("username") if access_mode == "strong" else None
@@ -311,25 +385,30 @@ def main() -> int:
         parent = listener["parent"]
         expected = public_ip if parent == "direct" else config["upstreams"][parent]["expected_egress_ip"]
         port = int(listener["port"])
+        probe_host = listener_probe_host(listener, args.scope, public_ip, default_listen_ip)
+        if probe_host is None:
+            add_listener_na(results, listener)
+            continue
         if listener["protocol"] == "socks5":
             run_check(results, endpoint, "tcp", True, expected, lambda p=port: socks_tcp(
-                public_ip, p, local_user, local_password, http_host, http_port, timeout
+                probe_host, p, local_user, local_password, http_host, http_port, timeout
             ))
             if "udp" in listener["capabilities"]:
                 run_check(results, endpoint, "udp_dns", True, None, lambda p=port: dns_probe(
-                    public_ip, p, local_user, local_password, dns_host, dns_port, timeout
+                    probe_host, p, local_user, local_password, dns_host, dns_port, timeout
                 ))
                 run_check(results, endpoint, "udp_stun", True, expected, lambda p=port: stun_probe(
-                    public_ip, p, local_user, local_password, stun_servers, timeout
+                    probe_host, p, local_user, local_password, stun_servers, timeout
                 ))
             else:
-                add_na(results, endpoint, "udp", "not supported by HTTP CONNECT parent")
+                parent_type = config["upstreams"][parent]["type"].upper() if parent != "direct" else "direct"
+                add_na(results, endpoint, "udp", f"not supported by {parent_type} CONNECT parent")
         else:
             run_check(results, endpoint, "http_get", True, expected, lambda p=port: http_get(
-                public_ip, p, local_user, local_password, http_host, http_port, timeout
+                probe_host, p, local_user, local_password, http_host, http_port, timeout
             ))
             run_check(results, endpoint, "http_connect", True, expected, lambda p=port: http_connect(
-                public_ip, p, local_user, local_password, http_host, http_port, timeout
+                probe_host, p, local_user, local_password, http_host, http_port, timeout
             ))
 
     for upstream_name, upstream in config["upstreams"].items():
@@ -337,7 +416,7 @@ def main() -> int:
         if args.endpoint and endpoint != args.endpoint:
             continue
         host, port = upstream["host"], int(upstream["port"])
-        user, password = upstream["username"], upstream["password"]
+        user, password = upstream.get("username"), upstream.get("password")
         expected = upstream["expected_egress_ip"]
         if upstream["type"] == "socks5":
             run_check(results, endpoint, "tcp", True, expected, lambda: socks_tcp(
@@ -349,12 +428,23 @@ def main() -> int:
             run_check(results, endpoint, "udp_stun", True, expected, lambda: stun_probe(
                 host, port, user, password, stun_servers, timeout
             ))
-        else:
+        elif upstream["type"] == "http":
             run_check(results, endpoint, "http_get", True, expected, lambda: http_get(
                 host, port, user, password, http_host, http_port, timeout
             ))
             run_check(results, endpoint, "http_connect", True, expected, lambda: http_connect(
                 host, port, user, password, http_host, http_port, timeout
+            ))
+        else:
+            server_name = upstream["tls_server_name"]
+            ca_file = config.get("tls", {}).get("client_ca_file")
+            run_check(results, endpoint, "https_get", True, expected, lambda: http_get(
+                host, port, user, password, http_host, http_port, timeout,
+                tls_server_name=server_name, ca_file=ca_file
+            ))
+            run_check(results, endpoint, "https_connect", True, expected, lambda: http_connect(
+                host, port, user, password, http_host, http_port, timeout,
+                tls_server_name=server_name, ca_file=ca_file
             ))
 
     for result in results:

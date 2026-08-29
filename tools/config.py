@@ -2,10 +2,9 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 import ipaddress
 import json
-import os
+import posixpath
 import re
 from pathlib import Path
 from typing import Any
@@ -20,12 +19,21 @@ EXPECTED_LISTENERS = {
     "http_direct": ("http", "direct", {"tcp"}),
     "http_via_socks": ("http", "socks_primary", {"tcp"}),
     "http_via_http": ("http", "http_primary", {"tcp"}),
+    "socks_via_https": ("socks5", "https_primary", {"tcp"}),
+    "http_via_https": ("http", "https_primary", {"tcp"}),
 }
 
 SUPPORTED_UPSTREAMS = {
     "socks_primary": ("socks5", {"tcp", "udp"}),
     "http_primary": ("http", {"tcp"}),
+    "https_primary": ("https", {"tcp"}),
 }
+
+DEFAULT_CLIENT_CA_FILE = "/etc/ssl/certs/ca-certificates.crt"
+BUILD_PROFILE = "cmake-openssl"
+INSTALL_VERSION = "1.0.0"
+INSTALL_SOURCE_URL = "https://github.com/3proxy/3proxy/archive/refs/tags/1.0.0.tar.gz"
+INSTALL_SHA256 = "35b07de1046f3aaeac4a7085101b7e5c453efa3527cbdc42a84690366c7ecfa8"
 
 
 def load_config(path: Path) -> dict[str, Any]:
@@ -55,16 +63,56 @@ def safe_token(value: Any, name: str, *, colon: bool = True) -> str:
     return value
 
 
+def dns_hostname(value: Any, name: str) -> str:
+    hostname = safe_token(value, name, colon=False)
+    if len(hostname) > 253 or hostname.endswith("."):
+        raise ValueError(f"{name} must be an unambiguous DNS hostname")
+    try:
+        ipaddress.ip_address(hostname)
+    except ValueError:
+        pass
+    else:
+        raise ValueError(f"{name} must be a DNS hostname, not an IP address")
+    labels = hostname.split(".")
+    if any(
+        not re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?", label)
+        for label in labels
+    ):
+        raise ValueError(f"{name} must be a valid DNS hostname")
+    return hostname
+
+
+def client_ca_file(data: dict[str, Any]) -> str:
+    return data.get("tls", {}).get("client_ca_file", DEFAULT_CLIENT_CA_FILE)
+
+
+def listener_ip(data: dict[str, Any], listener: dict[str, Any]) -> str:
+    return str(listener.get("listen_ip", data["server"]["listen_ip"]))
+
+
+def upstream_credentials(upstream: dict[str, Any], name: str) -> tuple[str | None, str | None]:
+    username = upstream.get("username")
+    password = upstream.get("password")
+    if (username is None) != (password is None):
+        raise ValueError(f"upstreams.{name}.username and password must be provided together")
+    if username is None:
+        return None, None
+    return (
+        safe_token(username, f"upstreams.{name}.username"),
+        safe_token(password, f"upstreams.{name}.password"),
+    )
+
+
 def validate(data: dict[str, Any]) -> None:
     install = data.get("install")
     if not isinstance(install, dict):
         raise ValueError("install must be a mapping")
-    if install.get("version") != "0.9.7":
-        raise ValueError("this patch-set is pinned to 3proxy 0.9.7")
-    if not re.fullmatch(r"[0-9a-f]{64}", str(install.get("sha256", ""))):
-        raise ValueError("install.sha256 must be a lowercase SHA-256")
-    if not str(install.get("source_url", "")).startswith("https://github.com/3proxy/3proxy/"):
-        raise ValueError("install.source_url must use the official 3proxy GitHub repository")
+    if install.get("version") != INSTALL_VERSION:
+        raise ValueError("this release is pinned to 3proxy 1.0.0")
+    if install.get("source_url") != INSTALL_SOURCE_URL:
+        raise ValueError("install.source_url must be the pinned official 3proxy 1.0.0 tag archive")
+    if install.get("sha256") != INSTALL_SHA256:
+        raise ValueError("install.sha256 must match the pinned official 3proxy 1.0.0 tag archive")
 
     server = data.get("server")
     if not isinstance(server, dict):
@@ -75,6 +123,22 @@ def validate(data: dict[str, Any]) -> None:
     if not isinstance(server.get("manage_ufw"), bool):
         raise ValueError("server.manage_ufw must be boolean")
 
+    tls = data.get("tls", {})
+    if not isinstance(tls, dict):
+        raise ValueError("tls must be a mapping")
+    unknown_tls = set(tls) - {"client_ca_file"}
+    if unknown_tls:
+        raise ValueError(f"unsupported tls settings: {sorted(unknown_tls)}")
+    ca_file = client_ca_file(data)
+    safe_token(ca_file, "tls.client_ca_file", colon=False)
+    if (
+        not ca_file.startswith("/")
+        or ca_file == "/"
+        or "//" in ca_file
+        or posixpath.normpath(ca_file) != ca_file
+    ):
+        raise ValueError("tls.client_ca_file must be an absolute normalized POSIX path")
+
     logging = data.get("logging", {})
     if not isinstance(logging, dict):
         raise ValueError("logging must be a mapping")
@@ -83,7 +147,7 @@ def validate(data: dict[str, Any]) -> None:
     if logging.get("rotation", "daily") != "daily":
         raise ValueError("logging.rotation must be daily")
     keep_files = logging.get("keep_files", 14)
-    if not isinstance(keep_files, int) or not 1 <= keep_files <= 365:
+    if isinstance(keep_files, bool) or not isinstance(keep_files, int) or not 1 <= keep_files <= 365:
         raise ValueError("logging.keep_files must be between 1 and 365")
     if not isinstance(logging.get("compress", True), bool):
         raise ValueError("logging.compress must be boolean")
@@ -125,13 +189,26 @@ def validate(data: dict[str, Any]) -> None:
         if not isinstance(upstream, dict):
             raise ValueError(f"upstreams.{name} must be a mapping")
         expected_type, expected_caps = SUPPORTED_UPSTREAMS[name]
+        allowed_keys = {
+            "type", "host", "port", "username", "password", "expected_egress_ip", "capabilities"
+        }
+        if expected_type == "https":
+            allowed_keys.add("tls_server_name")
+        unknown_keys = set(upstream) - allowed_keys
+        if unknown_keys:
+            raise ValueError(f"unsupported settings in upstreams.{name}: {sorted(unknown_keys)}")
         if upstream.get("type") != expected_type:
             raise ValueError(f"upstreams.{name}.type must be {expected_type}")
         safe_token(upstream.get("host"), f"upstreams.{name}.host", colon=False)
-        safe_token(upstream.get("username"), f"upstreams.{name}.username")
-        safe_token(upstream.get("password"), f"upstreams.{name}.password")
+        username, password = upstream_credentials(upstream, name)
+        if expected_type == "https":
+            dns_hostname(upstream.get("tls_server_name"), f"upstreams.{name}.tls_server_name")
+            if username is not None and (len(username.encode()) > 128 or len(password.encode()) > 128):
+                raise ValueError(f"upstreams.{name} HTTPS credentials must be at most 128 bytes")
+        elif "tls_server_name" in upstream:
+            raise ValueError(f"upstreams.{name}.tls_server_name is only valid for HTTPS upstreams")
         port = upstream.get("port")
-        if not isinstance(port, int) or not 1 <= port <= 65535:
+        if isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65535:
             raise ValueError(f"upstreams.{name}.port is invalid")
         ipaddress.ip_address(str(upstream.get("expected_egress_ip")))
         capabilities = set(upstream.get("capabilities", []))
@@ -153,9 +230,10 @@ def validate(data: dict[str, Any]) -> None:
             raise ValueError(f"duplicate listener id: {listener_id}")
         by_id[listener_id] = item
         port = item.get("port")
-        if not isinstance(port, int) or not 1 <= port <= 65535 or port in ports:
+        if isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65535 or port in ports:
             raise ValueError(f"invalid or duplicate listener port: {port}")
         ports.add(port)
+        ipaddress.ip_address(listener_ip(data, item))
     unknown_listeners = set(by_id) - set(EXPECTED_LISTENERS)
     if unknown_listeners:
         raise ValueError(f"unsupported listener ids: {sorted(unknown_listeners)}")
@@ -172,7 +250,7 @@ def validate(data: dict[str, Any]) -> None:
     if not isinstance(probes, dict):
         raise ValueError("probes must be a mapping")
     timeout = probes.get("timeout_seconds")
-    if not isinstance(timeout, (int, float)) or not 1 <= timeout <= 60:
+    if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or not 1 <= timeout <= 60:
         raise ValueError("probes.timeout_seconds must be between 1 and 60")
     if not isinstance(probes.get("stun_servers"), list) or not probes["stun_servers"]:
         raise ValueError("at least one STUN server is required")
@@ -180,10 +258,12 @@ def validate(data: dict[str, Any]) -> None:
 
 def parent_line(data: dict[str, Any], name: str) -> str:
     upstream = data["upstreams"][name]
-    parent_type = "socks5" if upstream["type"] == "socks5" else "connect+"
-    return "parent 1000 {} {} {} {} {}".format(
-        parent_type, upstream["host"], upstream["port"], upstream["username"], upstream["password"]
-    )
+    parent_type = {"socks5": "socks5", "http": "connect+", "https": "connect+s"}[upstream["type"]]
+    username, password = upstream_credentials(upstream, name)
+    fields: list[Any] = ["parent", 1000, parent_type, upstream["host"], upstream["port"]]
+    if username is not None:
+        fields.extend([username, password])
+    return " ".join(str(field) for field in fields)
 
 
 def render_3proxy(data: dict[str, Any]) -> str:
@@ -192,7 +272,6 @@ def render_3proxy(data: dict[str, Any]) -> str:
     local_auth = data.get("local_auth", {})
     user = local_auth.get("username")
     password = local_auth.get("password")
-    listen_ip = data["server"]["listen_ip"]
     public_ip = data["server"]["public_ip"]
     logging = data.get("logging", {})
     keep_files = logging.get("keep_files", 14)
@@ -210,8 +289,22 @@ def render_3proxy(data: dict[str, Any]) -> str:
         *([f"users {user}:CL:{password}"] if mode == "strong" else []),
         "",
     ]
+    https_upstream = data.get("upstreams", {}).get("https_primary")
+    if https_upstream is not None:
+        lines.extend([
+            "# Verified TLS client settings for HTTPS parent",
+            "ssl_client_mode 3",
+            "ssl_client_verify",
+            f"ssl_client_ca_file {client_ca_file(data)}",
+            f"ssl_client_sni {https_upstream['tls_server_name']}",
+            "ssl_client_min_proto_version TLSv1.2",
+            "",
+        ])
     for listener in sorted(data["listeners"], key=lambda item: item["port"]):
         lines.append(f"# {listener['id']}")
+        secure_parent = listener["parent"] == "https_primary"
+        if secure_parent:
+            lines.append("ssl_cli")
         if mode == "strong":
             lines.extend(["auth strong", f"allow {user}"])
         else:
@@ -220,18 +313,21 @@ def render_3proxy(data: dict[str, Any]) -> str:
             lines.append("deny *")
         if listener["parent"] != "direct":
             lines.append(parent_line(data, listener["parent"]))
+        bind_ip = listener_ip(data, listener)
         if listener["protocol"] == "socks5":
             nat = f" -Ni{public_ip}" if "udp" in listener["capabilities"] else ""
-            lines.append(f"socks -i{listen_ip} -p{listener['port']}{nat}")
+            lines.append(f"socks -i{bind_ip} -p{listener['port']}{nat}")
         else:
-            lines.append(f"proxy -i{listen_ip} -p{listener['port']}")
+            lines.append(f"proxy -i{bind_ip} -p{listener['port']}")
+        if secure_parent:
+            lines.append("ssl_nocli")
         lines.extend(["flush", ""])
     return "\n".join(lines)
 
 
 def render_systemd() -> str:
     return """[Unit]
-Description=3proxy - patched modular installation
+Description=3proxy - modular installation
 After=network-online.target
 Wants=network-online.target
 
@@ -256,7 +352,7 @@ def write_text(path: Path, value: str) -> None:
 def main() -> int:
     parser = argparse.ArgumentParser()
     sub = parser.add_subparsers(dest="command", required=True)
-    for name in ("validate", "get", "render-3proxy", "ports"):
+    for name in ("validate", "get", "render-3proxy", "ports", "firewall-ports", "external-udp"):
         item = sub.add_parser(name)
         item.add_argument("--config", type=Path, required=True)
         if name == "get":
@@ -273,10 +369,11 @@ def main() -> int:
         item.add_argument("--version", required=True)
         item.add_argument("--source-sha", required=True)
         item.add_argument("--patch-sha", required=True)
+        item.add_argument("--build-profile", required=True)
     manifest.add_argument("--binary-sha", required=True)
     args = parser.parse_args()
 
-    if args.command in {"validate", "get", "render-3proxy", "ports"}:
+    if args.command in {"validate", "get", "render-3proxy", "ports", "firewall-ports", "external-udp"}:
         data = load_config(args.config)
         validate(data)
     if args.command == "validate":
@@ -291,19 +388,31 @@ def main() -> int:
     elif args.command == "ports":
         for item in sorted(data["listeners"], key=lambda value: value["port"]):
             print(item["port"])
+    elif args.command == "firewall-ports":
+        for item in sorted(data["listeners"], key=lambda value: value["port"]):
+            if not ipaddress.ip_address(listener_ip(data, item)).is_loopback:
+                print(item["port"])
+    elif args.command == "external-udp":
+        print(str(any(
+            "udp" in item["capabilities"]
+            and not ipaddress.ip_address(listener_ip(data, item)).is_loopback
+            for item in data["listeners"]
+        )).lower())
     elif args.command == "manifest-matches":
         try:
             current = json.loads(args.manifest.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
             return 1
         return 0 if all(current.get(key) == value for key, value in {
-            "version": args.version, "source_sha256": args.source_sha, "patchset_sha256": args.patch_sha
+            "version": args.version, "source_sha256": args.source_sha,
+            "patchset_sha256": args.patch_sha, "build_profile": args.build_profile
         }.items()) else 1
     elif args.command == "write-manifest":
         payload = {
             "version": args.version,
             "source_sha256": args.source_sha,
             "patchset_sha256": args.patch_sha,
+            "build_profile": args.build_profile,
             "binary_sha256": args.binary_sha,
         }
         write_text(args.output, json.dumps(payload, indent=2, sort_keys=True) + "\n")

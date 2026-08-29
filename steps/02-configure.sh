@@ -41,10 +41,14 @@ echo "==> Generated /etc/3proxy/3proxy.cfg and systemd unit"
 
 if [[ "$(yaml_get server.manage_ufw)" == "true" ]] && command -v ufw >/dev/null 2>&1; then
   if ufw status | grep -q "Status: active"; then
-    while IFS= read -r port; do ufw allow "$port/tcp"; done < <(python3 "$SETUP_ROOT/tools/config.py" ports --config "$CONFIG")
-    cidr="$(yaml_get server.udp_client_cidr)"
-    ufw allow from "$cidr" to any port 1024:65535 proto udp
+    while IFS= read -r port; do ufw allow "$port/tcp"; done < <(
+      python3 "$SETUP_ROOT/tools/config.py" firewall-ports --config "$CONFIG"
+    )
+    if [[ "$(python3 "$SETUP_ROOT/tools/config.py" external-udp --config "$CONFIG")" == "true" ]]; then
+      cidr="$(yaml_get server.udp_client_cidr)"
+      ufw allow from "$cidr" to any port 1024:65535 proto udp
+    fi
   fi
 else
-  echo "==> Firewall management disabled; ensure TCP listeners and dynamic UDP relay ports are allowed"
+  echo "==> Firewall management disabled; expose only non-loopback TCP listeners and required UDP relay ports"
 fi

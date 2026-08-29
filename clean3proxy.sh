@@ -107,9 +107,11 @@ if [[ $PURGE_UFW -eq 1 ]]; then
   else
     while IFS= read -r port; do
       try_run ufw --force delete allow "$port/tcp"
-    done < <(python3 "$BASE_DIR/tools/config.py" ports --config "$saved_config")
-    cidr="$(python3 "$BASE_DIR/tools/config.py" get --config "$saved_config" --path server.udp_client_cidr)"
-    try_run ufw --force delete allow from "$cidr" to any port 1024:65535 proto udp
+    done < <(python3 "$BASE_DIR/tools/config.py" firewall-ports --config "$saved_config")
+    if [[ "$(python3 "$BASE_DIR/tools/config.py" external-udp --config "$saved_config")" == "true" ]]; then
+      cidr="$(python3 "$BASE_DIR/tools/config.py" get --config "$saved_config" --path server.udp_client_cidr)"
+      try_run ufw --force delete allow from "$cidr" to any port 1024:65535 proto udp
+    fi
   fi
 fi
 

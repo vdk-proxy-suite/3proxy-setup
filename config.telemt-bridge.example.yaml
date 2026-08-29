@@ -6,7 +6,7 @@ install:
 server:
   public_ip: "203.0.113.10"
   listen_ip: "0.0.0.0"
-  udp_client_cidr: "198.51.100.25/32"
+  udp_client_cidr: "127.0.0.1/32"
   manage_ufw: false
 
 logging:
@@ -16,22 +16,32 @@ logging:
   compress: true
 
 access:
-  mode: "iponly"
-  allowed_client_cidrs:
-    - "198.51.100.25/32"
+  mode: "strong"
 
-upstreams: {}
+local_auth:
+  username: "CHANGE_ME_LOCAL"
+  password: "CHANGE_ME_LOCAL"
+
+tls:
+  client_ca_file: "/etc/ssl/certs/ca-certificates.crt"
+
+upstreams:
+  https_primary:
+    type: "https"
+    host: "proxy.example.com"
+    port: 8443
+    username: "CHANGE_ME_UPSTREAM"
+    password: "CHANGE_ME_UPSTREAM"
+    tls_server_name: "proxy.example.com"
+    expected_egress_ip: "198.51.100.20"
+    capabilities: [tcp]
 
 listeners:
-  - id: "socks_direct"
+  - id: "socks_via_https"
     protocol: "socks5"
-    port: 1080
-    parent: "direct"
-    capabilities: [tcp, udp]
-  - id: "http_direct"
-    protocol: "http"
-    port: 8080
-    parent: "direct"
+    listen_ip: "127.0.0.1"
+    port: 11080
+    parent: "https_primary"
     capabilities: [tcp]
 
 probes:
