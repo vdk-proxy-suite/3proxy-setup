@@ -37,7 +37,19 @@ upstreams:
     capabilities: [tcp]
 
 listeners:
-  - id: "socks_via_https"
+  - id: "public_socks_tls"
+    protocol: "socks5"
+    listen_ip: "0.0.0.0"
+    port: 1082
+    parent: "https_primary"
+    capabilities: [tcp]
+  - id: "public_http_tls"
+    protocol: "http"
+    listen_ip: "0.0.0.0"
+    port: 8082
+    parent: "https_primary"
+    capabilities: [tcp]
+  - id: "local_socks_tls"
     protocol: "socks5"
     listen_ip: "127.0.0.1"
     port: 11080

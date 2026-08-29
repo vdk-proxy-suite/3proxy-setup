@@ -21,11 +21,11 @@ class BuildArchiveTests(unittest.TestCase):
         ".gitattributes": "* text=auto\n",
         ".gitignore": "*.zip\n*.sha256\n",
         "README.md": "# Fixture package\n",
-        "VERSION": "2.0.0\n",
+        "VERSION": "2.0.1\n",
         "clean3proxy.sh": "#!/bin/sh\n",
         "config.example.yaml": "access:\n  mode: strong\n",
         "config.iponly.example.yaml": "access:\n  mode: iponly\n",
-        "config.telemt-bridge.example.yaml": "bridge:\n  enabled: true\n",
+        "config.https.example.yaml": "tls:\n  client_ca_file: /fixture/ca.crt\n",
         "docs/operations.md": "# Operations\n",
         "examples/install.sh": "#!/bin/sh\n",
         "lib/common.sh": "#!/bin/sh\n",
@@ -73,9 +73,9 @@ class BuildArchiveTests(unittest.TestCase):
         for relative, contents in self.EXCLUDED_FILES.items():
             self.write_fixture(relative, contents)
 
-        self.output = self.source / "3proxy-setup-2.0.0.zip"
+        self.output = self.source / "3proxy-setup-2.0.1.zip"
         self.output.write_bytes(b"pre-existing release archive")
-        self.checksum = self.source / "3proxy-setup-2.0.0.zip.sha256"
+        self.checksum = self.source / "3proxy-setup-2.0.1.zip.sha256"
         self.checksum.write_text("pre-existing checksum\n", encoding="utf-8")
         self.write_fixture("previous-release.zip", "pre-existing zip\n")
         self.write_fixture("previous-release.sha256", "pre-existing checksum\n")
@@ -124,7 +124,7 @@ class BuildArchiveTests(unittest.TestCase):
             {"3proxy-setup"},
         )
         self.assertTrue(all(name.startswith(prefix) for name in names))
-        self.assertIn(prefix + "config.telemt-bridge.example.yaml", names)
+        self.assertIn(prefix + "config.https.example.yaml", names)
 
         excluded = set(self.EXCLUDED_FILES) | {
             self.output.name,

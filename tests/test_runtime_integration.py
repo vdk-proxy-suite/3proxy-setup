@@ -49,6 +49,16 @@ def _recv_header(sock: socket.socket, limit: int = 64 * 1024) -> bytes:
     return bytes(data)
 
 
+def _recv_exact(sock: socket.socket, size: int) -> bytes:
+    data = bytearray()
+    while len(data) < size:
+        chunk = sock.recv(size - len(data))
+        if not chunk:
+            raise ConnectionError("unexpected EOF")
+        data.extend(chunk)
+    return bytes(data)
+
+
 def _unused_loopback_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.bind(("127.0.0.1", 0))
@@ -445,6 +455,7 @@ class GeneratedHttpsBridgeRuntimeTests(unittest.TestCase):
         server_name: str = GOOD_PARENT_NAME,
         upstream_password: str = DUMMY_UPSTREAM_PASSWORD,
         upstream_auth: bool = True,
+        listeners: list[dict[str, object]] | None = None,
     ) -> Path:
         https_upstream = {
             "type": "https",
@@ -486,9 +497,9 @@ class GeneratedHttpsBridgeRuntimeTests(unittest.TestCase):
             "upstreams": {
                 "https_primary": https_upstream,
             },
-            "listeners": [
+            "listeners": listeners or [
                 {
-                    "id": "http_via_https",
+                    "id": "runtime.https-http",
                     "protocol": "http",
                     "listen_ip": "127.0.0.1",
                     "port": listener_port,
@@ -520,6 +531,7 @@ class GeneratedHttpsBridgeRuntimeTests(unittest.TestCase):
         server_name: str = GOOD_PARENT_NAME,
         upstream_password: str = DUMMY_UPSTREAM_PASSWORD,
         upstream_auth: bool = True,
+        listeners: list[dict[str, object]] | None = None,
     ) -> Iterator[_RunningProxy]:
         directory = self.temporary_root / scenario
         directory.mkdir(mode=0o700)
@@ -531,6 +543,7 @@ class GeneratedHttpsBridgeRuntimeTests(unittest.TestCase):
             server_name=server_name,
             upstream_password=upstream_password,
             upstream_auth=upstream_auth,
+            listeners=listeners,
         )
         stdout_path = directory / "3proxy.stdout"
         with stdout_path.open("wb") as stdout:
@@ -543,7 +556,13 @@ class GeneratedHttpsBridgeRuntimeTests(unittest.TestCase):
             )
             running = _RunningProxy(process, stdout_path, config_path)
             try:
-                self._wait_for_listener(running, listener_port)
+                listener_ports = (
+                    [listener_port]
+                    if listeners is None
+                    else [int(listener["port"]) for listener in listeners]
+                )
+                for port in listener_ports:
+                    self._wait_for_listener(running, port)
                 yield running
             finally:
                 if process.poll() is None:
@@ -604,6 +623,48 @@ class GeneratedHttpsBridgeRuntimeTests(unittest.TestCase):
                 tunneled = bytes(chunks)
             return _ProxyResult(status, header, tunneled)
 
+    def _socks_connect(
+        self,
+        proxy_port: int,
+        target_port: int,
+        payload: bytes,
+    ) -> bytes:
+        username = DUMMY_LOCAL_USER.encode("utf-8")
+        password = DUMMY_LOCAL_PASSWORD.encode("utf-8")
+        with socket.create_connection(("127.0.0.1", proxy_port), timeout=3) as client:
+            client.settimeout(5)
+            client.sendall(b"\x05\x01\x02")
+            self.assertEqual(_recv_exact(client, 2), b"\x05\x02")
+            client.sendall(
+                b"\x01"
+                + bytes([len(username)])
+                + username
+                + bytes([len(password)])
+                + password
+            )
+            self.assertEqual(_recv_exact(client, 2), b"\x01\x00")
+            client.sendall(
+                b"\x05\x01\x00\x01"
+                + socket.inet_aton("127.0.0.1")
+                + target_port.to_bytes(2, "big")
+            )
+            version, status, reserved, address_type = _recv_exact(client, 4)
+            self.assertEqual((version, status, reserved), (5, 0, 0))
+            if address_type == 1:
+                _recv_exact(client, 4)
+            elif address_type == 3:
+                _recv_exact(client, _recv_exact(client, 1)[0])
+            elif address_type == 4:
+                _recv_exact(client, 16)
+            else:
+                self.fail(f"unexpected SOCKS5 BND address type: {address_type}")
+            _recv_exact(client, 2)
+
+            client.sendall(payload)
+            expected_size = len(SENTINEL_PREFIX) + len(payload)
+            response = _recv_exact(client, expected_size)
+        return response
+
     def _assert_tls_only(self, parent: _TlsConnectParent) -> None:
         self.assertGreaterEqual(parent.connection_count, 1, "3proxy never contacted the configured parent")
         self.assertFalse(
@@ -654,6 +715,77 @@ class GeneratedHttpsBridgeRuntimeTests(unittest.TestCase):
             self.assertEqual(parent.connect_targets, [("127.0.0.1", sentinel.port)])
             self.assertEqual(sentinel.hit_count, 1)
             self.assertEqual(sentinel.payloads, [payload])
+            self.assertFalse(parent.tls_errors, parent.tls_errors)
+            self.assertFalse(parent.errors, parent.errors)
+
+    def test_multiple_generic_socks_listeners_share_verified_https_parent(self) -> None:
+        first_port = _unused_loopback_port()
+        second_port = _unused_loopback_port()
+        while second_port == first_port:
+            second_port = _unused_loopback_port()
+        listeners: list[dict[str, object]] = [
+            {
+                "id": "secure-socks.public",
+                "protocol": "socks5",
+                "listen_ip": "127.0.0.1",
+                "port": first_port,
+                "parent": "https_primary",
+                "capabilities": ["tcp"],
+            },
+            {
+                "id": "secure-socks.local",
+                "protocol": "socks5",
+                "listen_ip": "127.0.0.1",
+                "port": second_port,
+                "parent": "https_primary",
+                "capabilities": ["tcp"],
+            },
+        ]
+        first_payload = b"generic-first-socks-listener"
+        second_payload = b"generic-second-socks-listener"
+        with _SentinelTarget() as sentinel, _TlsConnectParent(
+            self.server_certificate,
+            self.server_key,
+            ("127.0.0.1", sentinel.port),
+        ) as parent:
+            with self._running_proxy(
+                "multiple-generic-socks",
+                first_port,
+                parent.port,
+                self.ca_certificate,
+                listeners=listeners,
+            ) as running:
+                rendered_lines = running.config_path.read_text(encoding="utf-8").splitlines()
+                self.assertIn("# secure-socks.public", rendered_lines)
+                self.assertIn("# secure-socks.local", rendered_lines)
+                self.assertEqual(rendered_lines.count("ssl_cli"), 2)
+                self.assertEqual(rendered_lines.count("ssl_nocli"), 2)
+                self.assertEqual(
+                    rendered_lines.count(
+                        f"parent 1000 connect+s 127.0.0.1 {parent.port} "
+                        f"{DUMMY_UPSTREAM_USER} {DUMMY_UPSTREAM_PASSWORD}"
+                    ),
+                    2,
+                )
+                first_response = self._socks_connect(first_port, sentinel.port, first_payload)
+                second_response = self._socks_connect(second_port, sentinel.port, second_payload)
+                self.assertEqual(first_response, SENTINEL_PREFIX + first_payload)
+                self.assertEqual(second_response, SENTINEL_PREFIX + second_payload)
+
+            self._assert_tls_only(parent)
+            self.assertEqual(parent.tls_sessions, 2)
+            self.assertEqual(parent.sni_names.count(GOOD_PARENT_NAME), 2)
+            expected_authorization = _basic_value(
+                DUMMY_UPSTREAM_USER,
+                DUMMY_UPSTREAM_PASSWORD,
+            )
+            self.assertEqual(parent.authorization_values.count(expected_authorization), 2)
+            self.assertEqual(
+                parent.connect_targets,
+                [("127.0.0.1", sentinel.port), ("127.0.0.1", sentinel.port)],
+            )
+            self.assertEqual(sentinel.hit_count, 2)
+            self.assertEqual(sentinel.payloads, [first_payload, second_payload])
             self.assertFalse(parent.tls_errors, parent.tls_errors)
             self.assertFalse(parent.errors, parent.errors)
 

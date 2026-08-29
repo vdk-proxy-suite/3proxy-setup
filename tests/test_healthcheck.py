@@ -663,6 +663,126 @@ class MainTests(HealthcheckMainMixin, unittest.TestCase):
             "203.0.113.10", 8083, None, None, "api.ipify.org", 80, 8.0
         )
 
+    def test_multiple_generic_listeners_share_https_parent_without_udp_probe(self) -> None:
+        config = make_health_config()
+        config["tls"] = {"client_ca_file": "/opt/ca/proxy.pem"}
+        config["upstreams"]["https_primary"] = {
+            "type": "https",
+            "host": "192.0.2.30",
+            "port": 8443,
+            "username": "upstream-user",
+            "password": "upstream-password",
+            "tls_server_name": "secure.example.test",
+            "expected_egress_ip": "198.51.100.30",
+            "capabilities": ["tcp"],
+        }
+        config["listeners"] = [
+            {
+                "id": "secure-egress.alpha",
+                "protocol": "socks5",
+                "port": 11080,
+                "parent": "https_primary",
+                "capabilities": ["tcp"],
+            },
+            {
+                "id": "secure-egress.beta",
+                "protocol": "http",
+                "port": 18080,
+                "parent": "https_primary",
+                "capabilities": ["tcp"],
+            },
+        ]
+        with mock.patch.object(healthcheck, "socks_tcp", return_value="198.51.100.30") as tcp, \
+                mock.patch.object(healthcheck, "dns_probe") as dns, \
+                mock.patch.object(healthcheck, "stun_probe") as stun, \
+                mock.patch.object(healthcheck, "http_get", return_value="198.51.100.30") as get, \
+                mock.patch.object(healthcheck, "http_connect", return_value="198.51.100.30") as connect:
+            result, output = self.invoke(config)
+        self.assertEqual(result, 0)
+        tcp.assert_called_once_with(
+            "203.0.113.10",
+            11080,
+            "local-user",
+            "local-password",
+            "api.ipify.org",
+            80,
+            8.0,
+        )
+        dns.assert_not_called()
+        stun.assert_not_called()
+        self.assertEqual(get.call_count, 2)
+        self.assertEqual(connect.call_count, 2)
+        self.assertIn("secure-egress.alpha", output)
+        self.assertIn("secure-egress.beta", output)
+        self.assertIn("upstream_https_primary", output)
+        self.assertIn("SUMMARY endpoints=3 passed=5 failed=0 n/a=1", output)
+
+    def test_tcp_only_socks_upstream_skips_udp_probes(self) -> None:
+        config = make_health_config()
+        config["upstreams"]["socks_primary"] = {
+            "type": "socks5",
+            "host": "socks.example.test",
+            "port": 1080,
+            "username": "upstream-user",
+            "password": "upstream-password",
+            "expected_egress_ip": "198.51.100.60",
+            "capabilities": ["tcp"],
+        }
+        with mock.patch.object(healthcheck, "socks_tcp", return_value="198.51.100.60") as tcp, \
+                mock.patch.object(healthcheck, "dns_probe") as dns, \
+                mock.patch.object(healthcheck, "stun_probe") as stun:
+            result, output = self.invoke(config, "--endpoint", "upstream_socks_primary")
+        self.assertEqual(result, 0)
+        tcp.assert_called_once_with(
+            "socks.example.test",
+            1080,
+            "upstream-user",
+            "upstream-password",
+            "api.ipify.org",
+            80,
+            8.0,
+        )
+        dns.assert_not_called()
+        stun.assert_not_called()
+        self.assertIn("not advertised by this SOCKS5 upstream", output)
+        self.assertIn("SUMMARY endpoints=1 passed=1 failed=0 n/a=1", output)
+
+    def test_udp_capable_socks_upstream_keeps_dns_and_stun_probes(self) -> None:
+        config = make_health_config()
+        config["upstreams"]["socks_primary"] = {
+            "type": "socks5",
+            "host": "socks.example.test",
+            "port": 1080,
+            "expected_egress_ip": "198.51.100.61",
+            "capabilities": ["tcp", "udp"],
+        }
+        with mock.patch.object(healthcheck, "socks_tcp", return_value="198.51.100.61") as tcp, \
+                mock.patch.object(
+                    healthcheck,
+                    "dns_probe",
+                    return_value="answers=1, relay=socks.example.test:5000",
+                ) as dns, \
+                mock.patch.object(
+                    healthcheck,
+                    "stun_probe",
+                    return_value="mapped=198.51.100.61:50000, relay=socks.example.test:5000",
+                ) as stun:
+            result, output = self.invoke(config, "--endpoint", "upstream_socks_primary")
+        self.assertEqual(result, 0)
+        tcp.assert_called_once()
+        dns.assert_called_once_with(
+            "socks.example.test", 1080, None, None, "1.1.1.1", 53, 8.0
+        )
+        stun.assert_called_once_with(
+            "socks.example.test",
+            1080,
+            None,
+            None,
+            config["probes"]["stun_servers"],
+            8.0,
+        )
+        self.assertIn("SUMMARY endpoints=1 passed=3 failed=0 n/a=0", output)
+
     def test_https_upstream_healthcheck_passes_auth_sni_ca_and_tls_check_names(self) -> None:
         config = make_health_config()
         config["tls"] = {"client_ca_file": "/opt/ca/proxy.pem"}

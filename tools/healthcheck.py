@@ -422,12 +422,20 @@ def main() -> int:
             run_check(results, endpoint, "tcp", True, expected, lambda: socks_tcp(
                 host, port, user, password, http_host, http_port, timeout
             ))
-            run_check(results, endpoint, "udp_dns", True, None, lambda: dns_probe(
-                host, port, user, password, dns_host, dns_port, timeout
-            ))
-            run_check(results, endpoint, "udp_stun", True, expected, lambda: stun_probe(
-                host, port, user, password, stun_servers, timeout
-            ))
+            if "udp" in upstream.get("capabilities", []):
+                run_check(results, endpoint, "udp_dns", True, None, lambda: dns_probe(
+                    host, port, user, password, dns_host, dns_port, timeout
+                ))
+                run_check(results, endpoint, "udp_stun", True, expected, lambda: stun_probe(
+                    host, port, user, password, stun_servers, timeout
+                ))
+            else:
+                add_na(
+                    results,
+                    endpoint,
+                    "udp",
+                    "not advertised by this SOCKS5 upstream",
+                )
         elif upstream["type"] == "http":
             run_check(results, endpoint, "http_get", True, expected, lambda: http_get(
                 host, port, user, password, http_host, http_port, timeout

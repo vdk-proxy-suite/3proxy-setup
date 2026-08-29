@@ -12,23 +12,14 @@ from typing import Any
 import yaml
 
 
-EXPECTED_LISTENERS = {
-    "socks_direct": ("socks5", "direct", {"tcp", "udp"}),
-    "socks_via_socks": ("socks5", "socks_primary", {"tcp", "udp"}),
-    "socks_via_http": ("socks5", "http_primary", {"tcp"}),
-    "http_direct": ("http", "direct", {"tcp"}),
-    "http_via_socks": ("http", "socks_primary", {"tcp"}),
-    "http_via_http": ("http", "http_primary", {"tcp"}),
-    "socks_via_https": ("socks5", "https_primary", {"tcp"}),
-    "http_via_https": ("http", "https_primary", {"tcp"}),
-}
-
 SUPPORTED_UPSTREAMS = {
-    "socks_primary": ("socks5", {"tcp", "udp"}),
-    "http_primary": ("http", {"tcp"}),
-    "https_primary": ("https", {"tcp"}),
+    "socks_primary": "socks5",
+    "http_primary": "http",
+    "https_primary": "https",
 }
 
+SUPPORTED_LISTENER_PROTOCOLS = {"socks5", "http"}
+LISTENER_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
 DEFAULT_CLIENT_CA_FILE = "/etc/ssl/certs/ca-certificates.crt"
 BUILD_PROFILE = "cmake-openssl"
 INSTALL_VERSION = "1.0.0"
@@ -88,6 +79,19 @@ def client_ca_file(data: dict[str, Any]) -> str:
 
 def listener_ip(data: dict[str, Any], listener: dict[str, Any]) -> str:
     return str(listener.get("listen_ip", data["server"]["listen_ip"]))
+
+
+def capability_set(value: Any, name: str, *, allow_udp: bool) -> set[str]:
+    if not isinstance(value, list) or not value or any(not isinstance(item, str) for item in value):
+        raise ValueError(f"{name} must be a non-empty list")
+    result = set(value)
+    if len(result) != len(value):
+        raise ValueError(f"{name} must not contain duplicates")
+    valid = {"tcp", "udp"} if allow_udp else {"tcp"}
+    if "tcp" not in result or not result <= valid:
+        requirement = "TCP with optional UDP" if allow_udp else "TCP only"
+        raise ValueError(f"{name} must support {requirement}")
+    return result
 
 
 def upstream_credentials(upstream: dict[str, Any], name: str) -> tuple[str | None, str | None]:
@@ -188,7 +192,7 @@ def validate(data: dict[str, Any]) -> None:
     for name, upstream in upstreams.items():
         if not isinstance(upstream, dict):
             raise ValueError(f"upstreams.{name} must be a mapping")
-        expected_type, expected_caps = SUPPORTED_UPSTREAMS[name]
+        expected_type = SUPPORTED_UPSTREAMS[name]
         allowed_keys = {
             "type", "host", "port", "username", "password", "expected_egress_ip", "capabilities"
         }
@@ -211,21 +215,26 @@ def validate(data: dict[str, Any]) -> None:
         if isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65535:
             raise ValueError(f"upstreams.{name}.port is invalid")
         ipaddress.ip_address(str(upstream.get("expected_egress_ip")))
-        capabilities = set(upstream.get("capabilities", []))
-        if capabilities != expected_caps:
-            raise ValueError(f"upstreams.{name}.capabilities must be {sorted(expected_caps)}")
+        capability_set(
+            upstream.get("capabilities", []),
+            f"upstreams.{name}.capabilities",
+            allow_udp=expected_type == "socks5",
+        )
 
     listeners = data.get("listeners")
     if not isinstance(listeners, list) or not listeners:
         raise ValueError("listeners must contain at least one entry")
-    if len(listeners) > len(EXPECTED_LISTENERS):
-        raise ValueError("listeners contains more entries than the supported topology")
     by_id: dict[str, dict[str, Any]] = {}
     ports: set[int] = set()
     for item in listeners:
         if not isinstance(item, dict) or not isinstance(item.get("id"), str):
             raise ValueError("each listener must be a mapping with id")
         listener_id = item["id"]
+        if not LISTENER_ID_PATTERN.fullmatch(listener_id):
+            raise ValueError(
+                "listener id must be 1-64 ASCII letters, digits, dots, underscores or hyphens "
+                "and start with a letter or digit"
+            )
         if listener_id in by_id:
             raise ValueError(f"duplicate listener id: {listener_id}")
         by_id[listener_id] = item
@@ -234,17 +243,22 @@ def validate(data: dict[str, Any]) -> None:
             raise ValueError(f"invalid or duplicate listener port: {port}")
         ports.add(port)
         ipaddress.ip_address(listener_ip(data, item))
-    unknown_listeners = set(by_id) - set(EXPECTED_LISTENERS)
-    if unknown_listeners:
-        raise ValueError(f"unsupported listener ids: {sorted(unknown_listeners)}")
     for listener_id, item in by_id.items():
-        protocol, parent, capabilities = EXPECTED_LISTENERS[listener_id]
-        if item.get("protocol") != protocol or item.get("parent") != parent:
-            raise ValueError(f"listener {listener_id} has an invalid protocol/parent mapping")
-        if set(item.get("capabilities", [])) != capabilities:
-            raise ValueError(f"listener {listener_id} has invalid capabilities")
-        if parent != "direct" and parent not in upstreams:
+        protocol = item.get("protocol")
+        if protocol not in SUPPORTED_LISTENER_PROTOCOLS:
+            raise ValueError(f"listener {listener_id} protocol must be socks5 or http")
+        parent = item.get("parent")
+        if not isinstance(parent, str) or (parent != "direct" and parent not in upstreams):
             raise ValueError(f"listener {listener_id} references undefined upstream {parent}")
+        listener_capabilities = capability_set(
+            item.get("capabilities", []),
+            f"listener {listener_id} capabilities",
+            allow_udp=protocol == "socks5",
+        )
+        if parent != "direct":
+            parent_capabilities = set(upstreams[parent]["capabilities"])
+            if not listener_capabilities <= parent_capabilities:
+                raise ValueError(f"listener {listener_id} capabilities exceed upstream {parent}")
 
     probes = data.get("probes")
     if not isinstance(probes, dict):
@@ -302,7 +316,10 @@ def render_3proxy(data: dict[str, Any]) -> str:
         ])
     for listener in sorted(data["listeners"], key=lambda item: item["port"]):
         lines.append(f"# {listener['id']}")
-        secure_parent = listener["parent"] == "https_primary"
+        secure_parent = (
+            listener["parent"] != "direct"
+            and data["upstreams"][listener["parent"]]["type"] == "https"
+        )
         if secure_parent:
             lines.append("ssl_cli")
         if mode == "strong":

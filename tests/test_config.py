@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import copy
 import io
 import json
 import sys
@@ -228,7 +227,7 @@ class ValidationTests(unittest.TestCase):
     def test_complete_v2_topology_is_valid(self) -> None:
         data = make_config()
         self.assertIsNone(config_tool.validate(data))
-        self.assertEqual(len(data["listeners"]), len(config_tool.EXPECTED_LISTENERS))
+        self.assertEqual(len(data["listeners"]), 8)
 
     def test_legacy_six_listener_strong_topology_remains_supported(self) -> None:
         data = make_config(include_https=False)
@@ -408,18 +407,64 @@ class ValidationTests(unittest.TestCase):
                 with context:
                     config_tool.validate(data)
 
-    def test_listener_topology_and_bind_addresses_are_validated(self) -> None:
+    def test_listener_ids_are_opaque_and_multiple_listeners_can_share_https_parent(self) -> None:
+        data = make_config()
+        data["listeners"] = [
+            {
+                "id": "public.socks-1",
+                "protocol": "socks5",
+                "listen_ip": "0.0.0.0",
+                "port": 1083,
+                "parent": "https_primary",
+                "capabilities": ["tcp"],
+            },
+            {
+                "id": "local_socks_2",
+                "protocol": "socks5",
+                "listen_ip": "127.0.0.1",
+                "port": 11080,
+                "parent": "https_primary",
+                "capabilities": ["tcp"],
+            },
+            {
+                "id": "public-http-3",
+                "protocol": "http",
+                "port": 8083,
+                "parent": "https_primary",
+                "capabilities": ["tcp"],
+            },
+        ]
+        for index in range(4, 10):
+            data["listeners"].append(
+                {
+                    "id": f"extra-route-{index}",
+                    "protocol": "socks5",
+                    "port": 12000 + index,
+                    "parent": "https_primary",
+                    "capabilities": ["tcp"],
+                }
+            )
+
+        config_tool.validate(data)
+        rendered = config_tool.render_3proxy(data)
+        self.assertEqual(len(data["listeners"]), 9)
+        self.assertEqual(rendered.count("parent 1000 connect+s "), 9)
+        self.assertEqual(rendered.count("\nssl_cli\n"), 9)
+        self.assertEqual(rendered.count("\nssl_nocli\n"), 9)
+        self.assertIn("# public.socks-1", rendered)
+        self.assertIn("socks -i127.0.0.1 -p11080", rendered)
+
+    def test_listener_shape_id_protocol_parent_and_bind_are_validated(self) -> None:
         cases = [
             (lambda d: d.__setitem__("listeners", []), "at least one"),
-            (lambda d: d["listeners"].append(copy.deepcopy(d["listeners"][0])), "more entries"),
             (lambda d: d["listeners"].__setitem__(0, []), "mapping with id"),
             (lambda d: d["listeners"][1].__setitem__("id", "socks_direct"), "duplicate listener id"),
             (lambda d: d["listeners"][1].__setitem__("port", d["listeners"][0]["port"]), "duplicate listener port"),
             (lambda d: d["listeners"][0].__setitem__("listen_ip", "bad"), None),
-            (lambda d: d["listeners"][0].__setitem__("id", "unknown"), "unsupported listener ids"),
-            (lambda d: d["listeners"][0].__setitem__("protocol", "http"), "invalid protocol/parent"),
-            (lambda d: d["listeners"][0].__setitem__("capabilities", ["tcp"]), "invalid capabilities"),
-            (lambda d: d["upstreams"].pop("socks_primary"), "undefined upstream"),
+            (lambda d: d["listeners"][0].__setitem__("protocol", "ftp"), "protocol must be socks5 or http"),
+            (lambda d: d["listeners"][0].__setitem__("parent", "missing"), "undefined upstream missing"),
+            (lambda d: d["listeners"][0].__setitem__("parent", None), "undefined upstream None"),
+            (lambda d: d["upstreams"].pop("socks_primary"), "undefined upstream socks_primary"),
         ]
         for mutate, message in cases:
             with self.subTest(message=message):
@@ -428,6 +473,89 @@ class ValidationTests(unittest.TestCase):
                 context = self.assertRaisesRegex(ValueError, message) if message else self.assertRaises(ValueError)
                 with context:
                     config_tool.validate(data)
+
+        for listener_id in ("a", "A0_.-route", "x" * 64):
+            with self.subTest(listener_id=listener_id):
+                data = make_config()
+                data["listeners"][0]["id"] = listener_id
+                config_tool.validate(data)
+
+        for listener_id in (
+            "_starts-with-symbol",
+            ".starts-with-symbol",
+            "-starts-with-symbol",
+            "contains space",
+            "contains/slash",
+            "contains:colon",
+            "non-ascii-я",
+            "x" * 65,
+            "",
+        ):
+            with self.subTest(listener_id=listener_id):
+                data = make_config()
+                data["listeners"][0]["id"] = listener_id
+                with self.assertRaisesRegex(ValueError, "listener id must be 1-64 ASCII"):
+                    config_tool.validate(data)
+
+    def test_listener_and_parent_capabilities_are_coherent(self) -> None:
+        tcp_only_socks_parent = make_config()
+        tcp_only_socks_parent["upstreams"]["socks_primary"]["capabilities"] = ["tcp"]
+        tcp_only_socks_parent["listeners"][1]["capabilities"] = ["tcp"]
+        config_tool.validate(tcp_only_socks_parent)
+
+        cases = [
+            (
+                lambda d: d["listeners"][0].__setitem__("capabilities", ["udp"]),
+                "must support TCP with optional UDP",
+            ),
+            (
+                lambda d: d["listeners"][0].__setitem__("capabilities", []),
+                "non-empty list",
+            ),
+            (
+                lambda d: d["listeners"][0].__setitem__("capabilities", ["tcp", "tcp"]),
+                "must not contain duplicates",
+            ),
+            (
+                lambda d: d["listeners"][0].__setitem__("capabilities", ["tcp", "quic"]),
+                "must support TCP with optional UDP",
+            ),
+            (
+                lambda d: d["listeners"][3].__setitem__("capabilities", ["tcp", "udp"]),
+                "must support TCP only",
+            ),
+            (
+                lambda d: d["listeners"][2].__setitem__("capabilities", ["tcp", "udp"]),
+                "capabilities exceed upstream http_primary",
+            ),
+            (
+                lambda d: d["listeners"][6].__setitem__("capabilities", ["tcp", "udp"]),
+                "capabilities exceed upstream https_primary",
+            ),
+            (
+                lambda d: d["upstreams"]["socks_primary"].__setitem__("capabilities", ["udp"]),
+                "must support TCP with optional UDP",
+            ),
+            (
+                lambda d: d["upstreams"]["http_primary"].__setitem__("capabilities", ["tcp", "udp"]),
+                "must support TCP only",
+            ),
+            (
+                lambda d: d["upstreams"]["https_primary"].__setitem__("capabilities", ["tcp", "udp"]),
+                "must support TCP only",
+            ),
+        ]
+        for mutate, message in cases:
+            with self.subTest(message=message):
+                data = make_config()
+                mutate(data)
+                with self.assertRaisesRegex(ValueError, message):
+                    config_tool.validate(data)
+
+        exceeds_tcp_only_socks = make_config()
+        exceeds_tcp_only_socks["upstreams"]["socks_primary"]["capabilities"] = ["tcp"]
+        with self.assertRaisesRegex(ValueError, "capabilities exceed upstream socks_primary"):
+            config_tool.validate(exceeds_tcp_only_socks)
 
 
 class RenderingTests(unittest.TestCase):

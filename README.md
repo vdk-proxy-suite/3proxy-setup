@@ -1,13 +1,14 @@
-# Standalone 3proxy setup 2.0.0
+# Standalone 3proxy setup 2.0.1
 
 Пакет устанавливает 3proxy 1.0.0 из проверенного tag-архива, собирает основной
 binary с обязательным OpenSSL client support, создаёт выбранные listeners и
 запускает health-check. Рассчитан на Ubuntu/Debian с `apt-get`, `systemd` и
 доступом в интернет.
 
-Версия 2.0.0 добавляет полноценный HTTPS upstream (`connect+s`) с обязательной
-проверкой CA и DNS-имени сертификата, отдельный bind для каждого listener и
-безопасный local-only профиль для цепочки Telemt → SOCKS5 → HTTPS proxy.
+Версия 2.0.1 разрешает произвольно именовать listeners и подключать несколько
+независимых SOCKS5/HTTP listeners к одному upstream, в том числе одновременно
+на публичных и loopback bind-адресах. Версия 2.0.0 добавила полноценный HTTPS
+upstream (`connect+s`) с обязательной проверкой CA и DNS-имени сертификата.
 Существующие direct, SOCKS5-parent, plaintext HTTP-parent, strong/iponly access,
 UDP и `monitor_v1` остаются совместимыми.
 
@@ -53,11 +54,17 @@ ZIP хранит Unix mode metadata: setup, cleanup, step-скрипты и Pyth
 sudo ./setup3proxy.sh reconfigure
 ```
 
-`reconfigure` не обновляет 3proxy. При переходе с 1.x setup-пакета на 2.0.0
+`reconfigure` не обновляет 3proxy. При переходе с 1.x setup-пакета на 2.x
 обязательно запускайте `all`, чтобы собрать и установить 3proxy 1.0.0.
 В существующем приватном YAML замените весь `install` block значениями из
 `config.example.yaml`. Новые `tls`, `https_primary` и HTTPS listeners не нужны,
 пока используется только прежняя direct/SOCKS5/HTTP topology.
+
+При обновлении с 2.0.0 на 2.0.1 пересборка binary не требуется: после замены
+setup-пакета достаточно `reconfigure`. Старые ID вроде `socks_via_https`
+остаются валидными и менять их необязательно. Специализированный bridge-example
+заменён общим `config.https.example.yaml`; приватные `config*.yaml` установщик и
+release-архив по-прежнему не включают.
 
 В `config.yaml` замените:
 
@@ -70,12 +77,12 @@ sudo ./setup3proxy.sh reconfigure
 Listener, привязанный к loopback, намеренно не добавляется в UFW. Облачный
 firewall/security group всегда настраивается отдельно.
 
-## HTTPS upstream для Telemt
+## HTTPS upstream и независимые listeners
 
-Начните с отдельного безопасного профиля:
+Начните с общего безопасного HTTPS-профиля:
 
 ```bash
-cp config.telemt-bridge.example.yaml config.yaml
+cp config.https.example.yaml config.yaml
 nano config.yaml
 sudo ./setup3proxy.sh all
 ```
@@ -98,7 +105,19 @@ upstreams:
     capabilities: [tcp]
 
 listeners:
-  - id: "socks_via_https"
+  - id: "public_socks_tls"
+    protocol: "socks5"
+    listen_ip: "0.0.0.0"
+    port: 1082
+    parent: "https_primary"
+    capabilities: [tcp]
+  - id: "public_http_tls"
+    protocol: "http"
+    listen_ip: "0.0.0.0"
+    port: 8082
+    parent: "https_primary"
+    capabilities: [tcp]
+  - id: "local_socks_tls"
     protocol: "socks5"
     listen_ip: "127.0.0.1"
     port: 11080
@@ -123,20 +142,23 @@ parent 1000 connect+s ...
 работает только по whitelist и не требует Basic auth, удалите одновременно
 `username` и `password`; указывать только одно из двух запрещено.
 
-Telemt подключается к `127.0.0.1:11080` как к обычному SOCKS5 upstream. Для
-этой двухступенчатой схемы у Telemt должно остаться `use_middle_proxy = false`:
-Telegram middle-proxy handshake требует внешний BND tuple, которого HTTP(S)
-CONNECT provider не сообщает локальному 3proxy. Это не отключает настроенный
-SOCKS upstream — Telemt всё равно соединяется с Telegram DC через него.
+Поле `id` — непрозрачная метка listener, а не имя предопределённой topology.
+Допустимы уникальные строки длиной до 64 символов по шаблону
+`^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$`. Маршрут задаётся исключительно полями
+`protocol`, `parent` и `capabilities`. Поэтому один `https_primary` можно
+без дублирования credentials использовать у нескольких публичных и локальных
+listeners. Порты listeners должны быть уникальны; loopback listener не создаёт
+публичное UFW-правило. Установщик намеренно не зависит от приложения, которое
+будет использовать конкретный listener.
 
 TLS применяется только на участке 3proxy → HTTPS upstream. Для каждого secure
 listener генератор включает `ssl_cli`, а сразу после service сбрасывает состояние
 через `ssl_nocli`, поэтому direct, SOCKS5 и plaintext HTTP listeners в том же
 процессе не меняются. UDP через HTTP(S) CONNECT не поддерживается и отклоняется
-схемой; direct UDP и UDP через SOCKS5 parent сохраняются.
-
-При необходимости можно вместо `socks_via_https` или вместе с ним объявить
-`http_via_https` (`protocol: http`, `parent: https_primary`, capabilities `[tcp]`).
+схемой. Direct SOCKS5 listener поддерживает UDP при `[tcp, udp]`. UDP через
+SOCKS5 parent можно объявлять только когда capabilities upstream и listener
+содержат `udp`, а провайдер действительно предоставляет рабочий SOCKS5 UDP
+ASSOCIATE relay; сам факт доступности его TCP-порта этого не гарантирует.
 
 ## Доступ и логирование
 
