@@ -1,0 +1,132 @@
+install:
+  version: "1.0.0"
+  source_url: "https://github.com/3proxy/3proxy/archive/refs/tags/1.0.0.tar.gz"
+  sha256: "35b07de1046f3aaeac4a7085101b7e5c453efa3527cbdc42a84690366c7ecfa8"
+
+server:
+  public_ip: "203.0.113.10"
+  listen_ip: "0.0.0.0"
+  udp_client_cidr: "198.51.100.25/32"
+  manage_ufw: false
+
+logging:
+  format: "monitor_v1"
+  rotation: "daily"
+  keep_files: 14
+  compress: true
+
+access:
+  mode: "strong"
+
+local_auth:
+  username: "CHANGE_ME_LOCAL"
+  password: "CHANGE_ME_LOCAL"
+
+tls:
+  client_ca_file: "/etc/ssl/certs/ca-certificates.crt"
+  server:
+    dns_names: []
+    validity_days: 365
+    ca_validity_days: 3650
+    regenerate_on_setup: false
+
+upstreams:
+  socks_primary:
+    type: "socks5"
+    host: "socks.proxy.example"
+    port: 1080
+    username: "CHANGE_ME_UPSTREAM"
+    password: "CHANGE_ME_UPSTREAM"
+    expected_egress_ip: "198.51.100.10"
+    capabilities: [tcp]
+  http_primary:
+    type: "http"
+    host: "http.proxy.example"
+    port: 8080
+    username: "CHANGE_ME_UPSTREAM"
+    password: "CHANGE_ME_UPSTREAM"
+    expected_egress_ip: "198.51.100.11"
+    capabilities: [tcp]
+  https_primary:
+    type: "https"
+    host: "https.proxy.example"
+    port: 8443
+    username: "CHANGE_ME_UPSTREAM"
+    password: "CHANGE_ME_UPSTREAM"
+    tls_server_name: "https.proxy.example"
+    expected_egress_ip: "198.51.100.12"
+    capabilities: [tcp]
+
+listeners:
+  - id: "socks_direct"
+    protocol: "socks5"
+    port: 1080
+    parent: "direct"
+    capabilities: [tcp, udp]
+  - id: "socks_via_socks"
+    protocol: "socks5"
+    port: 1081
+    parent: "socks_primary"
+    capabilities: [tcp]
+  - id: "socks_via_http"
+    protocol: "socks5"
+    port: 1082
+    parent: "http_primary"
+    capabilities: [tcp]
+  - id: "socks_via_https"
+    protocol: "socks5"
+    port: 1083
+    parent: "https_primary"
+    capabilities: [tcp]
+  - id: "http_direct"
+    protocol: "http"
+    port: 8080
+    parent: "direct"
+    capabilities: [tcp]
+  - id: "http_via_socks"
+    protocol: "http"
+    port: 8081
+    parent: "socks_primary"
+    capabilities: [tcp]
+  - id: "http_via_http"
+    protocol: "http"
+    port: 8082
+    parent: "http_primary"
+    capabilities: [tcp]
+  - id: "http_via_https"
+    protocol: "http"
+    port: 8083
+    parent: "https_primary"
+    capabilities: [tcp]
+  - id: "https_direct"
+    protocol: "https"
+    port: 8443
+    parent: "direct"
+    capabilities: [tcp]
+  - id: "https_via_socks"
+    protocol: "https"
+    port: 8444
+    parent: "socks_primary"
+    capabilities: [tcp]
+  - id: "https_via_http"
+    protocol: "https"
+    port: 8445
+    parent: "http_primary"
+    capabilities: [tcp]
+  - id: "https_via_https"
+    protocol: "https"
+    port: 8446
+    parent: "https_primary"
+    capabilities: [tcp]
+
+probes:
+  timeout_seconds: 8
+  http_host: "api.ipify.org"
+  http_port: 80
+  dns_server: "1.1.1.1"
+  dns_port: 53
+  stun_servers:
+    - host: "stun.l.google.com"
+      port: 19302
+    - host: "stun.cloudflare.com"
+      port: 3478

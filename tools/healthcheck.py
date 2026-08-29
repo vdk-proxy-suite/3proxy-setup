@@ -17,6 +17,9 @@ from typing import Any, Callable
 import yaml
 
 
+MANAGED_TLS_CA_FILE = "/etc/3proxy/tls/ca.crt"
+
+
 def recv_exact(sock: socket.socket, size: int) -> bytes:
     data = bytearray()
     while len(data) < size:
@@ -182,6 +185,47 @@ def http_connect(
     return body.decode(errors="replace")
 
 
+def tls_handshake(
+    proxy: str,
+    port: int,
+    timeout: float,
+    *,
+    tls_server_name: str,
+    ca_file: str,
+) -> str:
+    with open_proxy_connection(
+        proxy,
+        port,
+        timeout,
+        tls_server_name=tls_server_name,
+        ca_file=ca_file,
+    ) as sock:
+        version = sock.version()
+        cipher = sock.cipher()
+    if version not in {"TLSv1.2", "TLSv1.3"}:
+        raise RuntimeError(f"unexpected negotiated TLS version: {version}")
+    return f"version={version}, cipher={cipher[0] if cipher else 'unknown'}"
+
+
+def plaintext_proxy_rejected(proxy: str, port: int, timeout: float) -> str:
+    with socket.create_connection((proxy, port), timeout=timeout) as sock:
+        sock.settimeout(timeout)
+        try:
+            sock.sendall(
+                b"GET http://example.com/ HTTP/1.1\r\n"
+                b"Host: example.com\r\nConnection: close\r\n\r\n"
+            )
+            response = sock.recv(4096)
+        except socket.timeout as exc:
+            raise RuntimeError("plaintext rejection probe timed out") from exc
+        except (BrokenPipeError, ConnectionAbortedError, ConnectionResetError):
+            return "plaintext rejected"
+    if response.startswith(b"HTTP/"):
+        status = response.split(b"\r\n", 1)[0].decode(errors="replace")
+        raise RuntimeError(f"HTTPS listener accepted plaintext HTTP: {status}")
+    return "plaintext rejected"
+
+
 def encode_socks_udp_target(host: str, port: int) -> bytes:
     ipv4 = socket.gethostbyname(host)
     return b"\x00\x00\x00\x01" + socket.inet_aton(ipv4) + struct.pack("!H", port)
@@ -207,6 +251,28 @@ def decode_socks_udp(packet: bytes) -> tuple[bytes, str, int]:
         raise RuntimeError("truncated SOCKS5 UDP response")
     port = struct.unpack("!H", packet[offset:offset + 2])[0]
     return packet[offset + 2:], host, port
+
+
+def socks_udp_rejected(
+    proxy: str,
+    port: int,
+    user: str | None,
+    password: str | None,
+    timeout: float,
+) -> str:
+    with socket.create_connection((proxy, port), timeout=timeout) as control:
+        control.settimeout(timeout)
+        socks_auth(control, user, password)
+        control.sendall(b"\x05\x03\x00\x01\x00\x00\x00\x00\x00\x00")
+        try:
+            version, status, reserved, _address_type = recv_exact(control, 4)
+        except (ConnectionError, ConnectionAbortedError, ConnectionResetError):
+            return "UDP ASSOCIATE rejected by connection close"
+    if version != 5 or reserved != 0:
+        raise RuntimeError("invalid SOCKS5 UDP ASSOCIATE rejection")
+    if status == 0:
+        raise RuntimeError("TCP-only SOCKS listener accepted UDP ASSOCIATE")
+    return f"UDP ASSOCIATE rejected, status={status}"
 
 
 def socks_udp_exchange(
@@ -342,17 +408,35 @@ def listener_probe_host(listener: dict[str, Any], scope: str, public_ip: str, de
     return public_ip
 
 
+def listener_vm_bind_probe_host(listener: dict[str, Any], default_listen_ip: str) -> str:
+    bind_ip = str(listener.get("listen_ip", default_listen_ip))
+    address = ipaddress.ip_address(bind_ip)
+    if address.is_unspecified:
+        return "127.0.0.1" if address.version == 4 else "::1"
+    return bind_ip
+
+
 def add_listener_na(results: list[dict[str, Any]], listener: dict[str, Any]) -> None:
     endpoint = listener["id"]
     reason = "local-only listener is reachable only from the VM"
     if listener["protocol"] == "socks5":
         add_na(results, endpoint, "tcp", reason)
-        add_na(results, endpoint, "udp_dns" if "udp" in listener["capabilities"] else "udp", reason)
+        add_na(
+            results,
+            endpoint,
+            "udp_dns" if "udp" in listener["capabilities"] else "udp_rejected",
+            reason,
+        )
         if "udp" in listener["capabilities"]:
             add_na(results, endpoint, "udp_stun", reason)
-    else:
+    elif listener["protocol"] == "http":
         add_na(results, endpoint, "http_get", reason)
         add_na(results, endpoint, "http_connect", reason)
+    else:
+        add_na(results, endpoint, "tls_handshake", reason)
+        add_na(results, endpoint, "https_get", reason)
+        add_na(results, endpoint, "https_connect", reason)
+        add_na(results, endpoint, "plaintext_rejected", reason)
 
 
 def main() -> int:
@@ -362,6 +446,21 @@ def main() -> int:
     parser.add_argument("--endpoint")
     parser.add_argument("--timeout", type=float)
     parser.add_argument("--json", type=Path)
+    parser.add_argument(
+        "--proxy-ca-file",
+        type=Path,
+        help="CA certificate copied from /etc/3proxy/tls/ca.crt for HTTPS-listener E2E",
+    )
+    parser.add_argument(
+        "--tls-gate-only",
+        action="store_true",
+        help="for selected HTTPS listeners, check TLS identity and plaintext rejection without forwarding",
+    )
+    parser.add_argument(
+        "--skip-upstreams",
+        action="store_true",
+        help="probe configured listeners without contacting parent endpoints directly",
+    )
     args = parser.parse_args()
     config = load_config(args.config)
     timeout = args.timeout or float(config["probes"]["timeout_seconds"])
@@ -377,6 +476,27 @@ def main() -> int:
     dns_port = int(config["probes"]["dns_port"])
     stun_servers = config["probes"]["stun_servers"]
     results: list[dict[str, Any]] = []
+    available_endpoints = {listener["id"] for listener in config["listeners"]}
+    if not args.skip_upstreams:
+        available_endpoints.update(f"upstream_{name}" for name in config["upstreams"])
+    if args.endpoint is not None and args.endpoint not in available_endpoints:
+        parser.error(f"unknown or skipped endpoint: {args.endpoint}")
+    selected_https_listeners = [
+        listener
+        for listener in config["listeners"]
+        if listener["protocol"] == "https"
+        and (args.endpoint is None or args.endpoint == listener["id"])
+    ]
+    if args.scope == "e2e" and selected_https_listeners and args.proxy_ca_file is None:
+        parser.error(
+            "--proxy-ca-file is required for HTTPS-listener E2E; copy the VM's "
+            "/etc/3proxy/tls/ca.crt without copying its private key"
+        )
+    if args.proxy_ca_file is not None and not args.proxy_ca_file.is_file():
+        parser.error(f"proxy CA file not found: {args.proxy_ca_file}")
+    if args.tls_gate_only and not selected_https_listeners:
+        parser.error("--tls-gate-only requires a selected HTTPS listener")
+    proxy_ca_file = str(args.proxy_ca_file) if args.proxy_ca_file is not None else MANAGED_TLS_CA_FILE
 
     for listener in config["listeners"]:
         endpoint = listener["id"]
@@ -386,6 +506,8 @@ def main() -> int:
         expected = public_ip if parent == "direct" else config["upstreams"][parent]["expected_egress_ip"]
         port = int(listener["port"])
         probe_host = listener_probe_host(listener, args.scope, public_ip, default_listen_ip)
+        if args.tls_gate_only and args.scope == "vm":
+            probe_host = listener_vm_bind_probe_host(listener, default_listen_ip)
         if probe_host is None:
             add_listener_na(results, listener)
             continue
@@ -401,17 +523,57 @@ def main() -> int:
                     probe_host, p, local_user, local_password, stun_servers, timeout
                 ))
             else:
-                parent_type = config["upstreams"][parent]["type"].upper() if parent != "direct" else "direct"
-                add_na(results, endpoint, "udp", f"not supported by {parent_type} CONNECT parent")
-        else:
+                run_check(
+                    results,
+                    endpoint,
+                    "udp_rejected",
+                    True,
+                    None,
+                    lambda p=port: socks_udp_rejected(
+                        probe_host, p, local_user, local_password, timeout
+                    ),
+                )
+        elif listener["protocol"] == "http":
             run_check(results, endpoint, "http_get", True, expected, lambda p=port: http_get(
                 probe_host, p, local_user, local_password, http_host, http_port, timeout
             ))
             run_check(results, endpoint, "http_connect", True, expected, lambda p=port: http_connect(
                 probe_host, p, local_user, local_password, http_host, http_port, timeout
             ))
+        else:
+            run_check(
+                results,
+                endpoint,
+                "tls_handshake",
+                True,
+                None,
+                lambda p=port: tls_handshake(
+                    probe_host,
+                    p,
+                    timeout,
+                    tls_server_name=public_ip,
+                    ca_file=proxy_ca_file,
+                ),
+            )
+            if not args.tls_gate_only:
+                run_check(results, endpoint, "https_get", True, expected, lambda p=port: http_get(
+                    probe_host, p, local_user, local_password, http_host, http_port, timeout,
+                    tls_server_name=public_ip, ca_file=proxy_ca_file
+                ))
+                run_check(results, endpoint, "https_connect", True, expected, lambda p=port: http_connect(
+                    probe_host, p, local_user, local_password, http_host, http_port, timeout,
+                    tls_server_name=public_ip, ca_file=proxy_ca_file
+                ))
+            run_check(
+                results,
+                endpoint,
+                "plaintext_rejected",
+                True,
+                None,
+                lambda p=port: plaintext_proxy_rejected(probe_host, p, timeout),
+            )
 
-    for upstream_name, upstream in config["upstreams"].items():
+    for upstream_name, upstream in (() if args.skip_upstreams else config["upstreams"].items()):
         endpoint = f"upstream_{upstream_name}"
         if args.endpoint and endpoint != args.endpoint:
             continue

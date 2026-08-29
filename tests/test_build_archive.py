@@ -20,36 +20,59 @@ class BuildArchiveTests(unittest.TestCase):
     INTENDED_FILES = {
         ".gitattributes": "* text=auto\n",
         ".gitignore": "*.zip\n*.sha256\n",
+        ".env.example": "SAFE_PLACEHOLDER=change-me\n",
         "README.md": "# Fixture package\n",
-        "VERSION": "2.0.1\n",
+        "VERSION": "2.1.0\n",
         "clean3proxy.sh": "#!/bin/sh\n",
         "config.example.yaml": "access:\n  mode: strong\n",
         "config.iponly.example.yaml": "access:\n  mode: iponly\n",
         "config.https.example.yaml": "tls:\n  client_ca_file: /fixture/ca.crt\n",
+        "config.matrix.example.yaml": "tls:\n  server:\n    dns_names: []\n",
         "docs/operations.md": "# Operations\n",
         "examples/install.sh": "#!/bin/sh\n",
         "lib/common.sh": "#!/bin/sh\n",
+        "lib/tls.sh": "#!/bin/sh\n",
         "patches/0001-fix.patch": "fixture patch\n",
         "patches/README.md": "# Patches\n",
         "setup3proxy.sh": "#!/bin/sh\n",
         "steps/00-stop-backup.sh": "#!/bin/sh\n",
         "steps/01-install.sh": "#!/bin/sh\n",
+        "steps/02-configure.sh": "#!/bin/sh\n",
+        "steps/03-start-healthcheck.sh": "#!/bin/sh\n",
         "tests/fixture.sh": "#!/bin/sh\n",
         "tests/test_config.py": "def test_fixture():\n    pass\n",
         "tools/build_archive.py": "#!/usr/bin/env python3\n",
+        "tools/certificates.py": "#!/usr/bin/env python3\n",
         "tools/config.py": "#!/usr/bin/env python3\n",
+        "tools/healthcheck.py": "#!/usr/bin/env python3\n",
     }
 
     EXCLUDED_FILES = {
         ".agents/session.json": "{}\n",
+        ".env": "SECRET=do-not-package\n",
+        ".env.local": "SECRET=do-not-package\n",
         ".git/config": "[core]\n",
+        ".idea/workspace.xml": "local IDE state\n",
         ".venv/pyvenv.cfg": "home = fixture\n",
+        ".vscode/settings.json": "local editor state\n",
+        ".DS_Store": "finder metadata\n",
         "AGENTS.md": "local-only instructions\n",
+        "Thumbs.db": "explorer metadata\n",
         "captures/session.pcap": "pcap payload\n",
         "captures/session.pcapng": "pcapng payload\n",
         "config.prod.yaml": "credentials: secret\n",
         "config.yaml": "credentials: secret\n",
+        "certificates/ca.crt": "public certificate\n",
+        "certificates/ca.key": "private key\n",
+        "certificates/leaf.pem": "combined certificate\n",
+        "certificates/leaf.csr": "request\n",
+        "certificates/ca.srl": "serial\n",
+        "certificates/leaf.cnf": "openssl config\n",
+        "healthchecks/latest.json": "runtime health state\n",
+        "runtime/3proxy.log": "runtime log\n",
         "tests/__pycache__/test_config.cpython-312.pyc": "bytecode\n",
+        "tools/helper.pyd": "native extension\n",
+        "tools/helper.pyo": "optimized bytecode\n",
         "venv/pyvenv.cfg": "home = fixture\n",
     }
 
@@ -58,8 +81,12 @@ class BuildArchiveTests(unittest.TestCase):
         "setup3proxy.sh",
         "steps/00-stop-backup.sh",
         "steps/01-install.sh",
+        "steps/02-configure.sh",
+        "steps/03-start-healthcheck.sh",
         "tools/build_archive.py",
+        "tools/certificates.py",
         "tools/config.py",
+        "tools/healthcheck.py",
     }
 
     def setUp(self) -> None:
@@ -73,9 +100,9 @@ class BuildArchiveTests(unittest.TestCase):
         for relative, contents in self.EXCLUDED_FILES.items():
             self.write_fixture(relative, contents)
 
-        self.output = self.source / "3proxy-setup-2.0.1.zip"
+        self.output = self.source / "3proxy-setup-2.1.0.zip"
         self.output.write_bytes(b"pre-existing release archive")
-        self.checksum = self.source / "3proxy-setup-2.0.1.zip.sha256"
+        self.checksum = self.source / "3proxy-setup-2.1.0.zip.sha256"
         self.checksum.write_text("pre-existing checksum\n", encoding="utf-8")
         self.write_fixture("previous-release.zip", "pre-existing zip\n")
         self.write_fixture("previous-release.sha256", "pre-existing checksum\n")
@@ -125,6 +152,7 @@ class BuildArchiveTests(unittest.TestCase):
         )
         self.assertTrue(all(name.startswith(prefix) for name in names))
         self.assertIn(prefix + "config.https.example.yaml", names)
+        self.assertIn(prefix + "config.matrix.example.yaml", names)
 
         excluded = set(self.EXCLUDED_FILES) | {
             self.output.name,

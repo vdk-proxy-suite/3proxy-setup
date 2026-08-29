@@ -17,6 +17,17 @@ if ! systemctl is-active --quiet 3proxy; then
   exit 1
 fi
 
+https_listener_state="$(python3 "$SETUP_ROOT/tools/config.py" has-https-listener --config "$CONFIG")"
+if [[ "$https_listener_state" == "true" ]]; then
+  echo "==> Running mandatory TLS-first checks for HTTPS listeners"
+  https_listener_ids="$(python3 "$SETUP_ROOT/tools/config.py" https-listeners --config "$CONFIG")"
+  while IFS= read -r listener_id; do
+    [[ -n "$listener_id" ]] || continue
+    python3 "$SETUP_ROOT/tools/healthcheck.py" \
+      --config "$CONFIG" --scope vm --endpoint "$listener_id" --tls-gate-only
+  done <<< "$https_listener_ids"
+fi
+
 install -d -m 755 /var/log/3proxy/healthchecks
 stamp="$(date -u +%Y%m%dT%H%M%SZ)"
 report="/var/log/3proxy/healthchecks/$stamp.json"

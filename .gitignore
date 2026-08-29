@@ -4,6 +4,7 @@ config*.yaml
 !config.example.yaml
 !config.iponly.example.yaml
 !config.https.example.yaml
+!config.matrix.example.yaml
 .env
 .env.*
 !.env.example

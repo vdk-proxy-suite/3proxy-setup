@@ -39,10 +39,36 @@ restore_latest_backup() {
   load_backup_state || { echo "No backup state available; rollback skipped" >&2; return 1; }
   echo "==> Restoring backup: $BACKUP_DIR"
   systemctl stop 3proxy 2>/dev/null || true
-  [[ -f "$BACKUP_DIR/3proxy" ]] && install -m 755 "$BACKUP_DIR/3proxy" /usr/local/bin/3proxy
-  [[ -f "$BACKUP_DIR/3proxy.cfg" ]] && install -D -m 600 "$BACKUP_DIR/3proxy.cfg" /etc/3proxy/3proxy.cfg
-  [[ -f "$BACKUP_DIR/3proxy.service" ]] && install -D -m 644 "$BACKUP_DIR/3proxy.service" /etc/systemd/system/3proxy.service
-  [[ -f "$BACKUP_DIR/build-manifest.json" ]] && install -D -m 644 "$BACKUP_DIR/build-manifest.json" /usr/local/share/3proxy-build/manifest.json
+  if [[ -f "$BACKUP_DIR/3proxy" ]]; then
+    install -m 755 "$BACKUP_DIR/3proxy" /usr/local/bin/3proxy
+  else
+    rm -f -- /usr/local/bin/3proxy
+  fi
+  if [[ -f "$BACKUP_DIR/3proxy.cfg" ]]; then
+    install -D -m 600 "$BACKUP_DIR/3proxy.cfg" /etc/3proxy/3proxy.cfg
+  else
+    rm -f -- /etc/3proxy/3proxy.cfg
+  fi
+  if [[ -f "$BACKUP_DIR/setup.yaml" ]]; then
+    install -D -m 600 "$BACKUP_DIR/setup.yaml" /etc/3proxy/setup.yaml
+  else
+    rm -f -- /etc/3proxy/setup.yaml
+  fi
+  rm -rf -- /etc/3proxy/tls
+  if [[ -d "$BACKUP_DIR/tls" ]]; then
+    install -d -m 755 /etc/3proxy
+    cp -a "$BACKUP_DIR/tls" /etc/3proxy/tls
+  fi
+  if [[ -f "$BACKUP_DIR/3proxy.service" ]]; then
+    install -D -m 644 "$BACKUP_DIR/3proxy.service" /etc/systemd/system/3proxy.service
+  else
+    rm -f -- /etc/systemd/system/3proxy.service
+  fi
+  if [[ -f "$BACKUP_DIR/build-manifest.json" ]]; then
+    install -D -m 644 "$BACKUP_DIR/build-manifest.json" /usr/local/share/3proxy-build/manifest.json
+  else
+    rm -f -- /usr/local/share/3proxy-build/manifest.json
+  fi
   systemctl daemon-reload
   if [[ -f /etc/systemd/system/3proxy.service ]]; then
     systemctl enable 3proxy >/dev/null

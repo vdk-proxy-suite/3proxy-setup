@@ -10,12 +10,18 @@ import zipfile
 
 
 EXECUTABLE_NAMES = {"setup3proxy.sh", "clean3proxy.sh"}
-EXCLUDED_NAMES = {"AGENTS.md", "__pycache__", ".git", ".agents", "venv", ".venv"}
+EXCLUDED_NAMES = {
+    "AGENTS.md", "__pycache__", ".git", ".agents", ".idea", ".vscode",
+    ".DS_Store", "Thumbs.db", "healthchecks", "venv", ".venv",
+}
 
 
 def excluded(path: Path) -> bool:
-    if any(part in EXCLUDED_NAMES for part in path.parts) or path.suffix in {
-        ".pyc", ".pcap", ".pcapng", ".zip", ".sha256"
+    if path.name != ".env.example" and (path.name == ".env" or path.name.startswith(".env.")):
+        return True
+    if any(part in EXCLUDED_NAMES for part in path.parts) or path.suffix.lower() in {
+        ".pyc", ".pyo", ".pyd", ".log", ".pcap", ".pcapng", ".zip", ".sha256",
+        ".crt", ".key", ".pem", ".csr", ".srl", ".cnf", ".der", ".p12", ".pfx",
     }:
         return True
     return path.name.startswith("config") and path.suffix == ".yaml" and not path.name.endswith(".example.yaml")

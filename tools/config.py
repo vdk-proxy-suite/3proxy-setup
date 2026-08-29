@@ -18,9 +18,13 @@ SUPPORTED_UPSTREAMS = {
     "https_primary": "https",
 }
 
-SUPPORTED_LISTENER_PROTOCOLS = {"socks5", "http"}
+SUPPORTED_LISTENER_PROTOCOLS = {"socks5", "http", "https"}
 LISTENER_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
 DEFAULT_CLIENT_CA_FILE = "/etc/ssl/certs/ca-certificates.crt"
+MANAGED_TLS_DIR = "/etc/3proxy/tls"
+MANAGED_TLS_CA_FILE = f"{MANAGED_TLS_DIR}/ca.crt"
+MANAGED_TLS_SERVER_CERT_FILE = f"{MANAGED_TLS_DIR}/server.crt"
+MANAGED_TLS_SERVER_KEY_FILE = f"{MANAGED_TLS_DIR}/server.key"
 BUILD_PROFILE = "cmake-openssl"
 INSTALL_VERSION = "1.0.0"
 INSTALL_SOURCE_URL = "https://github.com/3proxy/3proxy/archive/refs/tags/1.0.0.tar.gz"
@@ -77,6 +81,26 @@ def client_ca_file(data: dict[str, Any]) -> str:
     return data.get("tls", {}).get("client_ca_file", DEFAULT_CLIENT_CA_FILE)
 
 
+def tls_server_config(data: dict[str, Any]) -> dict[str, Any] | None:
+    tls = data.get("tls", {})
+    server = tls.get("server") if isinstance(tls, dict) else None
+    return server if isinstance(server, dict) else None
+
+
+def has_https_parent(data: dict[str, Any]) -> bool:
+    return any(
+        isinstance(upstream, dict) and upstream.get("type") == "https"
+        for upstream in data.get("upstreams", {}).values()
+    )
+
+
+def has_https_listener(data: dict[str, Any]) -> bool:
+    return any(
+        isinstance(listener, dict) and listener.get("protocol") == "https"
+        for listener in data.get("listeners", [])
+    )
+
+
 def listener_ip(data: dict[str, Any], listener: dict[str, Any]) -> str:
     return str(listener.get("listen_ip", data["server"]["listen_ip"]))
 
@@ -130,18 +154,57 @@ def validate(data: dict[str, Any]) -> None:
     tls = data.get("tls", {})
     if not isinstance(tls, dict):
         raise ValueError("tls must be a mapping")
-    unknown_tls = set(tls) - {"client_ca_file"}
+    unknown_tls = set(tls) - {"client_ca_file", "server"}
     if unknown_tls:
         raise ValueError(f"unsupported tls settings: {sorted(unknown_tls)}")
-    ca_file = client_ca_file(data)
-    safe_token(ca_file, "tls.client_ca_file", colon=False)
-    if (
-        not ca_file.startswith("/")
-        or ca_file == "/"
-        or "//" in ca_file
-        or posixpath.normpath(ca_file) != ca_file
-    ):
-        raise ValueError("tls.client_ca_file must be an absolute normalized POSIX path")
+    if "client_ca_file" in tls:
+        ca_file = client_ca_file(data)
+        safe_token(ca_file, "tls.client_ca_file", colon=False)
+        if (
+            not ca_file.startswith("/")
+            or ca_file == "/"
+            or "//" in ca_file
+            or posixpath.normpath(ca_file) != ca_file
+        ):
+            raise ValueError("tls.client_ca_file must be an absolute normalized POSIX path")
+
+    tls_server = tls.get("server")
+    if tls_server is not None:
+        if not isinstance(tls_server, dict):
+            raise ValueError("tls.server must be a mapping")
+        unknown_server_tls = set(tls_server) - {
+            "dns_names", "validity_days", "ca_validity_days", "regenerate_on_setup"
+        }
+        if unknown_server_tls:
+            raise ValueError(f"unsupported tls.server settings: {sorted(unknown_server_tls)}")
+        dns_names = tls_server.get("dns_names")
+        if not isinstance(dns_names, list) or any(not isinstance(name, str) for name in dns_names):
+            raise ValueError("tls.server.dns_names must be a list of DNS hostnames")
+        normalized_dns_names: set[str] = set()
+        for index, value in enumerate(dns_names):
+            name = dns_hostname(value, f"tls.server.dns_names[{index}]")
+            normalized = name.lower()
+            if normalized in normalized_dns_names:
+                raise ValueError("tls.server.dns_names must not contain duplicates")
+            normalized_dns_names.add(normalized)
+        validity_days = tls_server.get("validity_days")
+        if (
+            isinstance(validity_days, bool)
+            or not isinstance(validity_days, int)
+            or not 2 <= validity_days <= 825
+        ):
+            raise ValueError("tls.server.validity_days must be between 2 and 825")
+        ca_validity_days = tls_server.get("ca_validity_days")
+        if (
+            isinstance(ca_validity_days, bool)
+            or not isinstance(ca_validity_days, int)
+            or not 2 <= ca_validity_days <= 3650
+        ):
+            raise ValueError("tls.server.ca_validity_days must be between 2 and 3650")
+        if ca_validity_days <= validity_days:
+            raise ValueError("tls.server.ca_validity_days must exceed validity_days")
+        if not isinstance(tls_server.get("regenerate_on_setup"), bool):
+            raise ValueError("tls.server.regenerate_on_setup must be boolean")
 
     logging = data.get("logging", {})
     if not isinstance(logging, dict):
@@ -220,6 +283,8 @@ def validate(data: dict[str, Any]) -> None:
             f"upstreams.{name}.capabilities",
             allow_udp=expected_type == "socks5",
         )
+    if "client_ca_file" in tls and not has_https_parent(data):
+        raise ValueError("tls.client_ca_file is only valid when an HTTPS upstream is configured")
 
     listeners = data.get("listeners")
     if not isinstance(listeners, list) or not listeners:
@@ -246,7 +311,7 @@ def validate(data: dict[str, Any]) -> None:
     for listener_id, item in by_id.items():
         protocol = item.get("protocol")
         if protocol not in SUPPORTED_LISTENER_PROTOCOLS:
-            raise ValueError(f"listener {listener_id} protocol must be socks5 or http")
+            raise ValueError(f"listener {listener_id} protocol must be socks5, http or https")
         parent = item.get("parent")
         if not isinstance(parent, str) or (parent != "direct" and parent not in upstreams):
             raise ValueError(f"listener {listener_id} references undefined upstream {parent}")
@@ -259,6 +324,10 @@ def validate(data: dict[str, Any]) -> None:
             parent_capabilities = set(upstreams[parent]["capabilities"])
             if not listener_capabilities <= parent_capabilities:
                 raise ValueError(f"listener {listener_id} capabilities exceed upstream {parent}")
+    if has_https_listener(data) and tls_server_config(data) is None:
+        raise ValueError("tls.server is required when an HTTPS listener is configured")
+    if tls_server_config(data) is not None and not has_https_listener(data):
+        raise ValueError("tls.server is only valid when an HTTPS listener is configured")
 
     probes = data.get("probes")
     if not isinstance(probes, dict):
@@ -303,6 +372,15 @@ def render_3proxy(data: dict[str, Any]) -> str:
         *([f"users {user}:CL:{password}"] if mode == "strong" else []),
         "",
     ]
+    if has_https_listener(data):
+        lines.extend([
+            "# Managed TLS server settings for HTTPS listeners",
+            f"ssl_server_cert {MANAGED_TLS_SERVER_CERT_FILE}",
+            f"ssl_server_key {MANAGED_TLS_SERVER_KEY_FILE}",
+            "ssl_server_min_proto_version TLSv1.2",
+            "ssl_server_no_verify",
+            "",
+        ])
     https_upstream = data.get("upstreams", {}).get("https_primary")
     if https_upstream is not None:
         lines.extend([
@@ -316,30 +394,76 @@ def render_3proxy(data: dict[str, Any]) -> str:
         ])
     for listener in sorted(data["listeners"], key=lambda item: item["port"]):
         lines.append(f"# {listener['id']}")
+        secure_listener = listener["protocol"] == "https"
         secure_parent = (
             listener["parent"] != "direct"
             and data["upstreams"][listener["parent"]]["type"] == "https"
         )
+        route = (
+            parent_line(data, listener["parent"])
+            if listener["parent"] != "direct"
+            else None
+        )
+        if secure_listener:
+            lines.append("ssl_serv")
         if secure_parent:
             lines.append("ssl_cli")
         if mode == "strong":
-            lines.extend(["auth strong", f"allow {user}"])
+            lines.append("auth strong")
+            if listener["protocol"] == "socks5" and "udp" not in listener["capabilities"]:
+                lines.append("deny * * * * UDPASSOC")
+            lines.append(f"allow {user}")
+            if route is not None:
+                lines.append(route)
         else:
             lines.append("auth iponly")
-            lines.extend(f"allow * {cidr}" for cidr in access["allowed_client_cidrs"])
+            if listener["protocol"] == "socks5" and "udp" not in listener["capabilities"]:
+                lines.append("deny * * * * UDPASSOC")
+            for cidr in access["allowed_client_cidrs"]:
+                lines.append(f"allow * {cidr}")
+                if route is not None:
+                    lines.append(route)
             lines.append("deny *")
-        if listener["parent"] != "direct":
-            lines.append(parent_line(data, listener["parent"]))
         bind_ip = listener_ip(data, listener)
         if listener["protocol"] == "socks5":
             nat = f" -Ni{public_ip}" if "udp" in listener["capabilities"] else ""
             lines.append(f"socks -i{bind_ip} -p{listener['port']}{nat}")
         else:
             lines.append(f"proxy -i{bind_ip} -p{listener['port']}")
+        if secure_listener:
+            lines.append("ssl_noserv")
         if secure_parent:
             lines.append("ssl_nocli")
         lines.extend(["flush", ""])
     return "\n".join(lines)
+
+
+def render_openssl(data: dict[str, Any]) -> str:
+    validate(data)
+    server_tls = tls_server_config(data)
+    if server_tls is None:
+        raise ValueError("tls.server is required to render the managed leaf certificate")
+    alt_names = [f"IP.1 = {data['server']['public_ip']}"]
+    alt_names.extend(
+        f"DNS.{index} = {name}"
+        for index, name in enumerate(server_tls["dns_names"], 1)
+    )
+    return "\n".join([
+        "[req]",
+        "distinguished_name = req_distinguished_name",
+        "req_extensions = v3_req",
+        "prompt = no",
+        "[req_distinguished_name]",
+        "CN = 3proxy-managed-leaf",
+        "[v3_req]",
+        "basicConstraints = critical,CA:FALSE",
+        "keyUsage = critical,digitalSignature,keyEncipherment",
+        "extendedKeyUsage = serverAuth",
+        "subjectAltName = @alt_names",
+        "[alt_names]",
+        *alt_names,
+        "",
+    ])
 
 
 def render_systemd() -> str:
@@ -369,12 +493,16 @@ def write_text(path: Path, value: str) -> None:
 def main() -> int:
     parser = argparse.ArgumentParser()
     sub = parser.add_subparsers(dest="command", required=True)
-    for name in ("validate", "get", "render-3proxy", "ports", "firewall-ports", "external-udp"):
+    config_commands = {
+        "validate", "get", "render-3proxy", "render-openssl", "ports", "firewall-ports",
+        "external-udp", "has-https-listener", "https-listeners", "tls-dns-names",
+    }
+    for name in sorted(config_commands):
         item = sub.add_parser(name)
         item.add_argument("--config", type=Path, required=True)
         if name == "get":
             item.add_argument("--path", required=True)
-        if name == "render-3proxy":
+        if name in {"render-3proxy", "render-openssl"}:
             item.add_argument("--output", type=Path, required=True)
     systemd = sub.add_parser("render-systemd")
     systemd.add_argument("--output", type=Path, required=True)
@@ -390,7 +518,7 @@ def main() -> int:
     manifest.add_argument("--binary-sha", required=True)
     args = parser.parse_args()
 
-    if args.command in {"validate", "get", "render-3proxy", "ports", "firewall-ports", "external-udp"}:
+    if args.command in config_commands:
         data = load_config(args.config)
         validate(data)
     if args.command == "validate":
@@ -400,6 +528,8 @@ def main() -> int:
         print(str(value).lower() if isinstance(value, bool) else value)
     elif args.command == "render-3proxy":
         write_text(args.output, render_3proxy(data))
+    elif args.command == "render-openssl":
+        write_text(args.output, render_openssl(data))
     elif args.command == "render-systemd":
         write_text(args.output, render_systemd())
     elif args.command == "ports":
@@ -415,6 +545,17 @@ def main() -> int:
             and not ipaddress.ip_address(listener_ip(data, item)).is_loopback
             for item in data["listeners"]
         )).lower())
+    elif args.command == "has-https-listener":
+        print(str(has_https_listener(data)).lower())
+    elif args.command == "https-listeners":
+        for item in sorted(data["listeners"], key=lambda value: value["port"]):
+            if item["protocol"] == "https":
+                print(item["id"])
+    elif args.command == "tls-dns-names":
+        server_tls = tls_server_config(data)
+        if server_tls is not None:
+            for name in server_tls["dns_names"]:
+                print(name)
     elif args.command == "manifest-matches":
         try:
             current = json.loads(args.manifest.read_text(encoding="utf-8"))

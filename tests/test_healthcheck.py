@@ -9,7 +9,7 @@ import struct
 import sys
 import tempfile
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest import mock
 
@@ -370,8 +370,102 @@ class TcpProbeTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "headers exceed 64 KiB"):
                 healthcheck.http_connect("proxy", 8080, None, None, "target", 80, 2)
 
+    def test_tls_handshake_reports_verified_tls12_or_newer(self) -> None:
+        sock = mock.MagicMock()
+        sock.__enter__.return_value = sock
+        sock.version.return_value = "TLSv1.3"
+        sock.cipher.return_value = ("TLS_AES_256_GCM_SHA384", "TLSv1.3", 256)
+        with mock.patch.object(healthcheck, "open_proxy_connection", return_value=sock) as open_connection:
+            detail = healthcheck.tls_handshake(
+                "203.0.113.10",
+                8443,
+                4,
+                tls_server_name="203.0.113.10",
+                ca_file="proxy-ca.crt",
+            )
+        self.assertEqual(detail, "version=TLSv1.3, cipher=TLS_AES_256_GCM_SHA384")
+        open_connection.assert_called_once_with(
+            "203.0.113.10",
+            8443,
+            4,
+            tls_server_name="203.0.113.10",
+            ca_file="proxy-ca.crt",
+        )
+
+        sock.version.return_value = "TLSv1.1"
+        with mock.patch.object(healthcheck, "open_proxy_connection", return_value=sock):
+            with self.assertRaisesRegex(RuntimeError, "unexpected negotiated TLS version"):
+                healthcheck.tls_handshake(
+                    "proxy",
+                    8443,
+                    4,
+                    tls_server_name="proxy.example",
+                    ca_file="proxy-ca.crt",
+                )
+
+    def test_plaintext_probe_requires_connection_but_accepts_tls_style_rejection(self) -> None:
+        for response in (b"", b"\x15\x03\x03\x00\x02\x02\x0a", ConnectionResetError()):
+            with self.subTest(response=repr(response)):
+                sock = FakeStreamSocket(response)
+                with mock.patch.object(healthcheck.socket, "create_connection", return_value=sock):
+                    self.assertEqual(
+                        healthcheck.plaintext_proxy_rejected("proxy", 8443, 2),
+                        "plaintext rejected",
+                    )
+
+        timed_out = FakeStreamSocket(socket.timeout())
+        with mock.patch.object(healthcheck.socket, "create_connection", return_value=timed_out):
+            with self.assertRaisesRegex(RuntimeError, "probe timed out"):
+                healthcheck.plaintext_proxy_rejected("proxy", 8443, 2)
+
+        with mock.patch.object(
+            healthcheck.socket,
+            "create_connection",
+            side_effect=ConnectionRefusedError("closed"),
+        ):
+            with self.assertRaises(ConnectionRefusedError):
+                healthcheck.plaintext_proxy_rejected("proxy", 8443, 2)
+
+    def test_plaintext_probe_fails_if_https_listener_speaks_http(self) -> None:
+        sock = FakeStreamSocket(b"HTTP/1.1 407 Proxy Authentication Required\r\n\r\n")
+        with mock.patch.object(healthcheck.socket, "create_connection", return_value=sock):
+            with self.assertRaisesRegex(RuntimeError, "accepted plaintext HTTP"):
+                healthcheck.plaintext_proxy_rejected("proxy", 8443, 2)
+
 
 class UdpProbeTests(unittest.TestCase):
+    def test_socks_udp_rejected_requires_nonzero_udp_associate_status(self) -> None:
+        rejected = FakeStreamSocket(b"\x05\x02", b"\x01\x00", b"\x05\x02\x00\x01")
+        with mock.patch.object(healthcheck.socket, "create_connection", return_value=rejected) as create:
+            detail = healthcheck.socks_udp_rejected(
+                "proxy.example", 1080, "alice", "secret", 4
+            )
+        self.assertEqual(detail, "UDP ASSOCIATE rejected, status=2")
+        create.assert_called_once_with(("proxy.example", 1080), timeout=4)
+        self.assertTrue(bytes(rejected.sent).endswith(
+            b"\x05\x03\x00\x01\x00\x00\x00\x00\x00\x00"
+        ))
+
+        accepted = FakeStreamSocket(b"\x05\x00", b"\x05\x00\x00\x01")
+        with mock.patch.object(healthcheck.socket, "create_connection", return_value=accepted):
+            with self.assertRaisesRegex(RuntimeError, "accepted UDP ASSOCIATE"):
+                healthcheck.socks_udp_rejected("proxy.example", 1080, None, None, 4)
+
+        closed = FakeStreamSocket(b"\x05\x00", b"")
+        with mock.patch.object(healthcheck.socket, "create_connection", return_value=closed):
+            self.assertEqual(
+                healthcheck.socks_udp_rejected("proxy.example", 1080, None, None, 4),
+                "UDP ASSOCIATE rejected by connection close",
+            )
+
+    def test_socks_udp_rejected_rejects_invalid_reply_header(self) -> None:
+        for reply in (b"\x04\x02\x00\x01", b"\x05\x02\x01\x01"):
+            with self.subTest(reply=reply):
+                sock = FakeStreamSocket(b"\x05\x00", reply)
+                with mock.patch.object(healthcheck.socket, "create_connection", return_value=sock):
+                    with self.assertRaisesRegex(RuntimeError, "invalid SOCKS5 UDP ASSOCIATE"):
+                        healthcheck.socks_udp_rejected("proxy.example", 1080, None, None, 4)
+
     def test_encode_socks_udp_target_resolves_ipv4(self) -> None:
         with mock.patch.object(healthcheck.socket, "gethostbyname", return_value="192.0.2.44") as resolve:
             encoded = healthcheck.encode_socks_udp_target("dns.example", 53)
@@ -559,6 +653,10 @@ class ResultAndScopeTests(unittest.TestCase):
             results,
             {"id": "http", "protocol": "http", "capabilities": ["tcp"]},
         )
+        healthcheck.add_listener_na(
+            results,
+            {"id": "https", "protocol": "https", "capabilities": ["tcp"]},
+        )
         self.assertEqual(
             [(item["endpoint"], item["check"], item["status"], item["required"]) for item in results],
             [
@@ -566,14 +664,35 @@ class ResultAndScopeTests(unittest.TestCase):
                 ("socks", "udp_dns", "N/A", False),
                 ("socks", "udp_stun", "N/A", False),
                 ("socks_tcp", "tcp", "N/A", False),
-                ("socks_tcp", "udp", "N/A", False),
+                ("socks_tcp", "udp_rejected", "N/A", False),
                 ("http", "http_get", "N/A", False),
                 ("http", "http_connect", "N/A", False),
+                ("https", "tls_handshake", "N/A", False),
+                ("https", "https_get", "N/A", False),
+                ("https", "https_connect", "N/A", False),
+                ("https", "plaintext_rejected", "N/A", False),
             ],
         )
 
 
 class MainTests(HealthcheckMainMixin, unittest.TestCase):
+    def test_unknown_or_skipped_endpoint_is_rejected(self) -> None:
+        config = make_health_config()
+        config["upstreams"]["http_primary"] = {
+            "type": "http",
+            "host": "proxy.example.test",
+            "port": 8080,
+            "capabilities": ["tcp"],
+        }
+        for arguments in (
+            ("--endpoint", "typo"),
+            ("--skip-upstreams", "--endpoint", "upstream_http_primary"),
+        ):
+            with self.subTest(arguments=arguments), self.assertRaises(SystemExit) as raised:
+                with redirect_stderr(io.StringIO()):
+                    self.invoke(config, *arguments)
+            self.assertEqual(raised.exception.code, 2)
+
     def test_e2e_scope_marks_loopback_listener_na_without_network_calls(self) -> None:
         config = make_health_config()
         config["listeners"] = [
@@ -634,6 +753,135 @@ class MainTests(HealthcheckMainMixin, unittest.TestCase):
         )
         self.assertIn("SUMMARY endpoints=1 passed=3 failed=0 n/a=0", output)
 
+    def test_vm_https_listener_uses_managed_ca_ip_identity_and_plaintext_gate(self) -> None:
+        config = make_health_config()
+        config["listeners"] = [
+            {
+                "id": "https_direct",
+                "protocol": "https",
+                "port": 8443,
+                "parent": "direct",
+                "listen_ip": "127.0.0.1",
+                "capabilities": ["tcp"],
+            }
+        ]
+        with mock.patch.object(
+                healthcheck,
+                "tls_handshake",
+                return_value="version=TLSv1.3, cipher=fixture",
+            ) as handshake, \
+                mock.patch.object(healthcheck, "http_get", return_value="203.0.113.10") as get, \
+                mock.patch.object(healthcheck, "http_connect", return_value="203.0.113.10") as connect, \
+                mock.patch.object(
+                    healthcheck,
+                    "plaintext_proxy_rejected",
+                    return_value="plaintext rejected",
+                ) as plaintext:
+            result, output = self.invoke(config, "--scope", "vm")
+        self.assertEqual(result, 0)
+        expected_tls = {
+            "tls_server_name": "203.0.113.10",
+            "ca_file": healthcheck.MANAGED_TLS_CA_FILE,
+        }
+        self.assertEqual(get.call_args.args[:4], ("127.0.0.1", 8443, "local-user", "local-password"))
+        self.assertEqual(get.call_args.kwargs, expected_tls)
+        self.assertEqual(connect.call_args.kwargs, expected_tls)
+        handshake.assert_called_once_with(
+            "127.0.0.1",
+            8443,
+            8.0,
+            tls_server_name="203.0.113.10",
+            ca_file=healthcheck.MANAGED_TLS_CA_FILE,
+        )
+        plaintext.assert_called_once_with("127.0.0.1", 8443, 8.0)
+        self.assertIn("SUMMARY endpoints=1 passed=4 failed=0 n/a=0", output)
+
+    def test_iponly_vm_tls_gate_does_not_attempt_forwarding(self) -> None:
+        config = make_health_config(mode="iponly")
+        config["listeners"] = [
+            {
+                "id": "https_direct",
+                "protocol": "https",
+                "port": 8443,
+                "parent": "direct",
+                "capabilities": ["tcp"],
+            }
+        ]
+        with mock.patch(
+                "healthcheck.tls_handshake",
+                return_value="version=TLSv1.3, cipher=fixture",
+            ) as handshake, \
+                mock.patch(
+                    "healthcheck.plaintext_proxy_rejected",
+                    return_value="plaintext rejected",
+                ) as plaintext, \
+                mock.patch("healthcheck.http_get") as get, \
+                mock.patch("healthcheck.http_connect") as connect:
+            result, output = self.invoke(
+                config,
+                "--scope",
+                "vm",
+                "--endpoint",
+                "https_direct",
+                "--tls-gate-only",
+            )
+        self.assertEqual(result, 0)
+        handshake.assert_called_once_with(
+            "127.0.0.1",
+            8443,
+            8.0,
+            tls_server_name="203.0.113.10",
+            ca_file=healthcheck.MANAGED_TLS_CA_FILE,
+        )
+        plaintext.assert_called_once_with("127.0.0.1", 8443, 8.0)
+        get.assert_not_called()
+        connect.assert_not_called()
+        self.assertIn("SUMMARY endpoints=1 passed=2 failed=0 n/a=0", output)
+
+    def test_e2e_https_listener_requires_explicit_existing_proxy_ca(self) -> None:
+        config = make_health_config()
+        config["listeners"] = [
+            {
+                "id": "https_direct",
+                "protocol": "https",
+                "port": 8443,
+                "parent": "direct",
+                "capabilities": ["tcp"],
+            }
+        ]
+        with self.assertRaises(SystemExit), redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+            self.invoke(config, "--scope", "e2e")
+
+        with tempfile.TemporaryDirectory() as directory:
+            ca_file = Path(directory) / "proxy-ca.crt"
+            ca_file.write_text("fixture CA", encoding="utf-8")
+            with mock.patch.object(
+                    healthcheck,
+                    "tls_handshake",
+                    return_value="version=TLSv1.3, cipher=fixture",
+                ), \
+                    mock.patch.object(healthcheck, "http_get", return_value="203.0.113.10") as get, \
+                    mock.patch.object(healthcheck, "http_connect", return_value="203.0.113.10") as connect, \
+                    mock.patch.object(
+                        healthcheck,
+                        "plaintext_proxy_rejected",
+                        return_value="plaintext rejected",
+                    ):
+                result, output = self.invoke(
+                    config,
+                    "--scope",
+                    "e2e",
+                    "--proxy-ca-file",
+                    str(ca_file),
+                )
+        self.assertEqual(result, 0)
+        self.assertEqual(
+            get.call_args.kwargs,
+            {"tls_server_name": "203.0.113.10", "ca_file": str(ca_file)},
+        )
+        self.assertEqual(connect.call_args.kwargs, get.call_args.kwargs)
+        self.assertIn("SUMMARY endpoints=1 passed=4 failed=0 n/a=0", output)
+
     def test_iponly_listener_uses_noauth_and_https_parent_expected_egress(self) -> None:
         config = make_health_config(mode="iponly")
         config["upstreams"]["https_primary"] = {
@@ -693,6 +941,11 @@ class MainTests(HealthcheckMainMixin, unittest.TestCase):
             },
         ]
         with mock.patch.object(healthcheck, "socks_tcp", return_value="198.51.100.30") as tcp, \
+                mock.patch.object(
+                    healthcheck,
+                    "socks_udp_rejected",
+                    return_value="UDP ASSOCIATE rejected, status=2",
+                ) as udp_rejected, \
                 mock.patch.object(healthcheck, "dns_probe") as dns, \
                 mock.patch.object(healthcheck, "stun_probe") as stun, \
                 mock.patch.object(healthcheck, "http_get", return_value="198.51.100.30") as get, \
@@ -708,6 +961,9 @@ class MainTests(HealthcheckMainMixin, unittest.TestCase):
             80,
             8.0,
         )
+        udp_rejected.assert_called_once_with(
+            "203.0.113.10", 11080, "local-user", "local-password", 8.0
+        )
         dns.assert_not_called()
         stun.assert_not_called()
         self.assertEqual(get.call_count, 2)
@@ -715,7 +971,7 @@ class MainTests(HealthcheckMainMixin, unittest.TestCase):
         self.assertIn("secure-egress.alpha", output)
         self.assertIn("secure-egress.beta", output)
         self.assertIn("upstream_https_primary", output)
-        self.assertIn("SUMMARY endpoints=3 passed=5 failed=0 n/a=1", output)
+        self.assertIn("SUMMARY endpoints=3 passed=6 failed=0 n/a=0", output)
 
     def test_tcp_only_socks_upstream_skips_udp_probes(self) -> None:
         config = make_health_config()
@@ -889,6 +1145,32 @@ class MainTests(HealthcheckMainMixin, unittest.TestCase):
         self.assertEqual(get.call_args.args[:2], ("proxy.example", 3128))
         self.assertEqual(connect.call_args.args[:2], ("proxy.example", 3128))
         self.assertNotIn("http_direct", output)
+        self.assertIn("SUMMARY endpoints=1 passed=2 failed=0 n/a=0", output)
+
+    def test_skip_upstreams_keeps_listener_e2e_without_direct_parent_probe(self) -> None:
+        config = make_health_config()
+        config["listeners"] = [
+            {
+                "id": "http_direct",
+                "protocol": "http",
+                "port": 8080,
+                "parent": "direct",
+                "capabilities": ["tcp"],
+            }
+        ]
+        config["upstreams"]["http_primary"] = {
+            "type": "http",
+            "host": "whitelist-only-parent.example",
+            "port": 3128,
+            "expected_egress_ip": "198.51.100.50",
+        }
+        with mock.patch.object(healthcheck, "http_get", return_value="203.0.113.10") as get, \
+                mock.patch.object(healthcheck, "http_connect", return_value="203.0.113.10") as connect:
+            result, output = self.invoke(config, "--scope", "e2e", "--skip-upstreams")
+        self.assertEqual(result, 0)
+        self.assertEqual(get.call_count, 1)
+        self.assertEqual(connect.call_count, 1)
+        self.assertNotIn("upstream_http_primary", output)
         self.assertIn("SUMMARY endpoints=1 passed=2 failed=0 n/a=0", output)
 
 

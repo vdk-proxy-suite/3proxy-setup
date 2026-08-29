@@ -456,6 +456,7 @@ class GeneratedHttpsBridgeRuntimeTests(unittest.TestCase):
         upstream_password: str = DUMMY_UPSTREAM_PASSWORD,
         upstream_auth: bool = True,
         listeners: list[dict[str, object]] | None = None,
+        access_mode: str = "strong",
     ) -> Path:
         https_upstream = {
             "type": "https",
@@ -489,10 +490,9 @@ class GeneratedHttpsBridgeRuntimeTests(unittest.TestCase):
                 "keep_files": 1,
                 "compress": False,
             },
-            "access": {"mode": "strong", "allowed_client_cidrs": []},
-            "local_auth": {
-                "username": DUMMY_LOCAL_USER,
-                "password": DUMMY_LOCAL_PASSWORD,
+            "access": {
+                "mode": access_mode,
+                "allowed_client_cidrs": ["127.0.0.1/32"] if access_mode == "iponly" else [],
             },
             "upstreams": {
                 "https_primary": https_upstream,
@@ -509,8 +509,29 @@ class GeneratedHttpsBridgeRuntimeTests(unittest.TestCase):
             ],
             "probes": {"timeout_seconds": 3, "stun_servers": ["127.0.0.1:9"]},
         }
+        if access_mode == "strong":
+            data["local_auth"] = {
+                "username": DUMMY_LOCAL_USER,
+                "password": DUMMY_LOCAL_PASSWORD,
+            }
+        effective_listeners = listeners or data["listeners"]
+        if any(listener["protocol"] == "https" for listener in effective_listeners):
+            data["tls"]["server"] = {
+                "dns_names": [GOOD_PARENT_NAME],
+                "validity_days": 2,
+                "ca_validity_days": 3,
+                "regenerate_on_setup": False,
+            }
         self.config_tool.validate(data)
         rendered = self.config_tool.render_3proxy(data)
+        if any(listener["protocol"] == "https" for listener in effective_listeners):
+            rendered = rendered.replace(
+                self.config_tool.MANAGED_TLS_SERVER_CERT_FILE,
+                str(self.server_certificate),
+            ).replace(
+                self.config_tool.MANAGED_TLS_SERVER_KEY_FILE,
+                str(self.server_key),
+            )
         production_log = "log /var/log/3proxy/3proxy.log D"
         self.assertEqual(rendered.count(production_log), 1)
         rendered = rendered.replace(production_log, f"log {directory / '3proxy.log'} D")
@@ -532,6 +553,7 @@ class GeneratedHttpsBridgeRuntimeTests(unittest.TestCase):
         upstream_password: str = DUMMY_UPSTREAM_PASSWORD,
         upstream_auth: bool = True,
         listeners: list[dict[str, object]] | None = None,
+        access_mode: str = "strong",
     ) -> Iterator[_RunningProxy]:
         directory = self.temporary_root / scenario
         directory.mkdir(mode=0o700)
@@ -544,6 +566,7 @@ class GeneratedHttpsBridgeRuntimeTests(unittest.TestCase):
             upstream_password=upstream_password,
             upstream_auth=upstream_auth,
             listeners=listeners,
+            access_mode=access_mode,
         )
         stdout_path = directory / "3proxy.stdout"
         with stdout_path.open("wb") as stdout:
@@ -623,6 +646,45 @@ class GeneratedHttpsBridgeRuntimeTests(unittest.TestCase):
                 tunneled = bytes(chunks)
             return _ProxyResult(status, header, tunneled)
 
+    def _https_proxy_connect(
+        self,
+        proxy_port: int,
+        target_port: int,
+        credentials: tuple[str, str] | None,
+        payload: bytes,
+        *,
+        ca_file: Path | None = None,
+        server_name: str = GOOD_PARENT_NAME,
+    ) -> _ProxyResult:
+        context = ssl.create_default_context(cafile=str(ca_file or self.ca_certificate))
+        context.minimum_version = ssl.TLSVersion.TLSv1_2
+        context.check_hostname = True
+        context.verify_mode = ssl.CERT_REQUIRED
+        with socket.create_connection(("127.0.0.1", proxy_port), timeout=3) as raw:
+            with context.wrap_socket(raw, server_hostname=server_name) as client:
+                client.settimeout(5)
+                lines = [
+                    f"CONNECT 127.0.0.1:{target_port} HTTP/1.1",
+                    f"Host: 127.0.0.1:{target_port}",
+                ]
+                if credentials is not None:
+                    lines.append(f"Proxy-Authorization: {_basic_value(*credentials)}")
+                client.sendall(("\r\n".join(lines) + "\r\n\r\n").encode("ascii"))
+                header = _recv_header(client)
+                match = re.match(rb"HTTP/\d\.\d (\d{3})", header)
+                status = int(match.group(1)) if match else None
+                tunneled = b""
+                if status is not None and 200 <= status < 300:
+                    client.sendall(payload)
+                    tunneled = _recv_exact(client, len(SENTINEL_PREFIX) + len(payload))
+                return _ProxyResult(status, header, tunneled)
+
+    def _plaintext_proxy_status(self, proxy_port: int, target_port: int) -> int | None:
+        try:
+            return self._proxy_connect(proxy_port, target_port, None, b"plaintext-must-fail").status
+        except (BrokenPipeError, ConnectionAbortedError, ConnectionResetError, socket.timeout):
+            return None
+
     def _socks_connect(
         self,
         proxy_port: int,
@@ -665,6 +727,29 @@ class GeneratedHttpsBridgeRuntimeTests(unittest.TestCase):
             response = _recv_exact(client, expected_size)
         return response
 
+    def _socks_udp_associate_status(self, proxy_port: int) -> int | None:
+        username = DUMMY_LOCAL_USER.encode("utf-8")
+        password = DUMMY_LOCAL_PASSWORD.encode("utf-8")
+        with socket.create_connection(("127.0.0.1", proxy_port), timeout=3) as client:
+            client.settimeout(5)
+            client.sendall(b"\x05\x01\x02")
+            self.assertEqual(_recv_exact(client, 2), b"\x05\x02")
+            client.sendall(
+                b"\x01"
+                + bytes([len(username)])
+                + username
+                + bytes([len(password)])
+                + password
+            )
+            self.assertEqual(_recv_exact(client, 2), b"\x01\x00")
+            client.sendall(b"\x05\x03\x00\x01\x00\x00\x00\x00\x00\x00")
+            try:
+                version, status, reserved, _address_type = _recv_exact(client, 4)
+            except (ConnectionError, ConnectionAbortedError, ConnectionResetError):
+                return None
+        self.assertEqual((version, reserved), (5, 0))
+        return status
+
     def _assert_tls_only(self, parent: _TlsConnectParent) -> None:
         self.assertGreaterEqual(parent.connection_count, 1, "3proxy never contacted the configured parent")
         self.assertFalse(
@@ -675,6 +760,293 @@ class GeneratedHttpsBridgeRuntimeTests(unittest.TestCase):
             all(prefix.startswith(b"\x16\x03") for prefix in parent.raw_prefixes),
             f"first parent bytes were not TLS ClientHello records: {parent.raw_prefixes!r}",
         )
+
+    def test_https_frontend_is_verified_tls_only_and_keeps_local_auth_inside_tls(self) -> None:
+        listener_port = _unused_loopback_port()
+        payload = b"https-frontend-direct"
+        listeners: list[dict[str, object]] = [
+            {
+                "id": "runtime.https-direct",
+                "protocol": "https",
+                "listen_ip": "127.0.0.1",
+                "port": listener_port,
+                "parent": "direct",
+                "capabilities": ["tcp"],
+            }
+        ]
+        with _SentinelTarget() as sentinel:
+            with self._running_proxy(
+                "https-frontend-direct",
+                listener_port,
+                _unused_loopback_port(),
+                self.ca_certificate,
+                listeners=listeners,
+            ) as running:
+                rendered = running.config_path.read_text(encoding="utf-8")
+                block = rendered[rendered.index("# runtime.https-direct"):]
+                self.assertIn("ssl_serv\nauth strong", block)
+                self.assertIn(f"proxy -i127.0.0.1 -p{listener_port}\nssl_noserv\nflush", block)
+                self.assertNotIn("ssl_cli", block)
+
+                self.assertIsNone(self._plaintext_proxy_status(listener_port, sentinel.port))
+                unauthenticated = self._https_proxy_connect(
+                    listener_port,
+                    sentinel.port,
+                    None,
+                    payload,
+                )
+                self.assertEqual(unauthenticated.status, 407)
+                self.assertEqual(sentinel.hit_count, 0)
+
+                with self.assertRaises(ssl.SSLCertVerificationError):
+                    self._https_proxy_connect(
+                        listener_port,
+                        sentinel.port,
+                        (DUMMY_LOCAL_USER, DUMMY_LOCAL_PASSWORD),
+                        payload,
+                        ca_file=self.untrusted_ca_certificate,
+                    )
+                with self.assertRaises(ssl.SSLCertVerificationError):
+                    self._https_proxy_connect(
+                        listener_port,
+                        sentinel.port,
+                        (DUMMY_LOCAL_USER, DUMMY_LOCAL_PASSWORD),
+                        payload,
+                        server_name=WRONG_PARENT_NAME,
+                    )
+                self.assertEqual(sentinel.hit_count, 0)
+
+                result = self._https_proxy_connect(
+                    listener_port,
+                    sentinel.port,
+                    (DUMMY_LOCAL_USER, DUMMY_LOCAL_PASSWORD),
+                    payload,
+                )
+                self.assertEqual(result.status, 200, running.diagnostics())
+                self.assertEqual(result.tunneled, SENTINEL_PREFIX + payload)
+            self.assertEqual(sentinel.hit_count, 1)
+            self.assertEqual(sentinel.payloads, [payload])
+
+    def test_https_frontend_direct_supports_iponly_without_basic_auth(self) -> None:
+        listener_port = _unused_loopback_port()
+        payload = b"https-frontend-iponly"
+        listeners: list[dict[str, object]] = [
+            {
+                "id": "runtime.https-iponly",
+                "protocol": "https",
+                "listen_ip": "127.0.0.1",
+                "port": listener_port,
+                "parent": "direct",
+                "capabilities": ["tcp"],
+            }
+        ]
+        with _SentinelTarget() as sentinel:
+            with self._running_proxy(
+                "https-frontend-iponly",
+                listener_port,
+                _unused_loopback_port(),
+                self.ca_certificate,
+                listeners=listeners,
+                access_mode="iponly",
+            ) as running:
+                rendered = running.config_path.read_text(encoding="utf-8")
+                block = rendered[rendered.index("# runtime.https-iponly"):]
+                self.assertIn(
+                    "ssl_serv\nauth iponly\nallow * 127.0.0.1/32\ndeny *\n"
+                    f"proxy -i127.0.0.1 -p{listener_port}\nssl_noserv\nflush",
+                    block,
+                )
+                self.assertIsNone(self._plaintext_proxy_status(listener_port, sentinel.port))
+                result = self._https_proxy_connect(
+                    listener_port,
+                    sentinel.port,
+                    None,
+                    payload,
+                )
+                self.assertEqual(result.status, 200, running.diagnostics())
+                self.assertEqual(result.tunneled, SENTINEL_PREFIX + payload)
+            self.assertEqual(sentinel.payloads, [payload])
+
+    def test_https_frontend_to_https_parent_enables_both_tls_directions(self) -> None:
+        listener_port = _unused_loopback_port()
+        payload = b"https-frontend-to-https-parent"
+        listeners: list[dict[str, object]] = [
+            {
+                "id": "runtime.https-to-https",
+                "protocol": "https",
+                "listen_ip": "127.0.0.1",
+                "port": listener_port,
+                "parent": "https_primary",
+                "capabilities": ["tcp"],
+            }
+        ]
+        with _SentinelTarget() as sentinel, _TlsConnectParent(
+            self.server_certificate,
+            self.server_key,
+            ("127.0.0.1", sentinel.port),
+        ) as parent:
+            with self._running_proxy(
+                "https-frontend-to-https-parent",
+                listener_port,
+                parent.port,
+                self.ca_certificate,
+                listeners=listeners,
+            ) as running:
+                rendered = running.config_path.read_text(encoding="utf-8")
+                block = rendered[rendered.index("# runtime.https-to-https"):]
+                self.assertIn(
+                    "ssl_serv\nssl_cli\nauth strong\nallow " + DUMMY_LOCAL_USER,
+                    block,
+                )
+                self.assertIn(
+                    f"proxy -i127.0.0.1 -p{listener_port}\n"
+                    "ssl_noserv\nssl_nocli\nflush",
+                    block,
+                )
+                self.assertIsNone(self._plaintext_proxy_status(listener_port, sentinel.port))
+                self.assertEqual(parent.connection_count, 0)
+                result = self._https_proxy_connect(
+                    listener_port,
+                    sentinel.port,
+                    (DUMMY_LOCAL_USER, DUMMY_LOCAL_PASSWORD),
+                    payload,
+                )
+                self.assertTrue(parent.wait_for_attempt(), running.diagnostics())
+                self.assertEqual(result.status, 200, running.diagnostics())
+                self.assertEqual(result.tunneled, SENTINEL_PREFIX + payload)
+
+            self._assert_tls_only(parent)
+            self.assertEqual(parent.tls_sessions, 1)
+            self.assertEqual(parent.connect_targets, [("127.0.0.1", sentinel.port)])
+            self.assertEqual(sentinel.payloads, [payload])
+
+    def test_tls_state_is_reset_before_plain_http_and_socks_listeners(self) -> None:
+        https_port, http_port, socks_port = sorted(
+            (_unused_loopback_port(), _unused_loopback_port(), _unused_loopback_port())
+        )
+        listeners: list[dict[str, object]] = [
+            {
+                "id": "runtime.https-first",
+                "protocol": "https",
+                "listen_ip": "127.0.0.1",
+                "port": https_port,
+                "parent": "https_primary",
+                "capabilities": ["tcp"],
+            },
+            {
+                "id": "runtime.http-after-tls",
+                "protocol": "http",
+                "listen_ip": "127.0.0.1",
+                "port": http_port,
+                "parent": "direct",
+                "capabilities": ["tcp"],
+            },
+            {
+                "id": "runtime.socks-after-tls",
+                "protocol": "socks5",
+                "listen_ip": "127.0.0.1",
+                "port": socks_port,
+                "parent": "direct",
+                "capabilities": ["tcp"],
+            },
+        ]
+        with _SentinelTarget() as sentinel, _TlsConnectParent(
+            self.server_certificate,
+            self.server_key,
+            ("127.0.0.1", sentinel.port),
+        ) as parent:
+            with self._running_proxy(
+                "tls-state-reset",
+                https_port,
+                parent.port,
+                self.ca_certificate,
+                listeners=listeners,
+            ) as running:
+                rendered = running.config_path.read_text(encoding="utf-8")
+                secure_block = rendered[
+                    rendered.index("# runtime.https-first"):rendered.index("# runtime.http-after-tls")
+                ]
+                plaintext_blocks = rendered[rendered.index("# runtime.http-after-tls"):]
+                self.assertIn("ssl_noserv\nssl_nocli\nflush", secure_block)
+                self.assertNotIn("ssl_serv", plaintext_blocks)
+                self.assertNotIn("ssl_cli", plaintext_blocks)
+
+                https_payload = b"secure-route"
+                https_result = self._https_proxy_connect(
+                    https_port,
+                    sentinel.port,
+                    (DUMMY_LOCAL_USER, DUMMY_LOCAL_PASSWORD),
+                    https_payload,
+                )
+                self.assertEqual(https_result.status, 200, running.diagnostics())
+                self.assertEqual(https_result.tunneled, SENTINEL_PREFIX + https_payload)
+
+                http_payload = b"plaintext-http-route"
+                http_result = self._proxy_connect(
+                    http_port,
+                    sentinel.port,
+                    (DUMMY_LOCAL_USER, DUMMY_LOCAL_PASSWORD),
+                    http_payload,
+                )
+                self.assertEqual(http_result.status, 200, running.diagnostics())
+                self.assertEqual(http_result.tunneled, SENTINEL_PREFIX + http_payload)
+
+                socks_payload = b"plaintext-socks-route"
+                socks_result = self._socks_connect(socks_port, sentinel.port, socks_payload)
+                self.assertEqual(socks_result, SENTINEL_PREFIX + socks_payload, running.diagnostics())
+
+            self._assert_tls_only(parent)
+            self.assertEqual(parent.tls_sessions, 1)
+            self.assertEqual(parent.connect_targets, [("127.0.0.1", sentinel.port)])
+            self.assertEqual(
+                sentinel.payloads,
+                [b"secure-route", b"plaintext-http-route", b"plaintext-socks-route"],
+            )
+
+    def test_tcp_only_socks_listener_rejects_udp_associate_before_https_parent(self) -> None:
+        listener_port = _unused_loopback_port()
+        payload = b"socks-tcp-only"
+        listeners: list[dict[str, object]] = [
+            {
+                "id": "runtime.socks-tcp-only",
+                "protocol": "socks5",
+                "listen_ip": "127.0.0.1",
+                "port": listener_port,
+                "parent": "https_primary",
+                "capabilities": ["tcp"],
+            }
+        ]
+        with _SentinelTarget() as sentinel, _TlsConnectParent(
+            self.server_certificate,
+            self.server_key,
+            ("127.0.0.1", sentinel.port),
+        ) as parent:
+            with self._running_proxy(
+                "socks-tcp-only",
+                listener_port,
+                parent.port,
+                self.ca_certificate,
+                listeners=listeners,
+            ) as running:
+                rendered = running.config_path.read_text(encoding="utf-8")
+                block = rendered[rendered.index("# runtime.socks-tcp-only"):]
+                self.assertLess(
+                    block.index("deny * * * * UDPASSOC"),
+                    block.index("allow " + DUMMY_LOCAL_USER),
+                )
+
+                status = self._socks_udp_associate_status(listener_port)
+                self.assertNotEqual(status, 0, running.diagnostics())
+                self.assertEqual(parent.connection_count, 0, "UDP ASSOCIATE reached the parent")
+
+                response = self._socks_connect(listener_port, sentinel.port, payload)
+                self.assertEqual(response, SENTINEL_PREFIX + payload, running.diagnostics())
+                self.assertTrue(parent.wait_for_attempt(), running.diagnostics())
+
+            self._assert_tls_only(parent)
+            self.assertEqual(parent.tls_sessions, 1)
+            self.assertEqual(parent.connect_targets, [("127.0.0.1", sentinel.port)])
+            self.assertEqual(sentinel.payloads, [payload])
 
     def test_authenticated_connect_roundtrip_is_tls_from_first_byte(self) -> None:
         listener_port = _unused_loopback_port()

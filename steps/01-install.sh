@@ -22,10 +22,16 @@ fi
 
 export DEBIAN_FRONTEND=noninteractive
 apt-get update
-apt-get install -y --no-install-recommends build-essential cmake curl ca-certificates libssl-dev patch python3-yaml iproute2
+apt-get install -y --no-install-recommends build-essential cmake curl ca-certificates libssl-dev openssl patch python3-yaml iproute2
 
 work="$(mktemp -d /tmp/3proxy-build.XXXXXX)"
-cleanup() { rm -rf -- "$work"; }
+feature_pid=""
+feature_parent_pid=""
+cleanup() {
+  [[ -z "$feature_pid" ]] || kill "$feature_pid" 2>/dev/null || true
+  [[ -z "$feature_parent_pid" ]] || kill "$feature_parent_pid" 2>/dev/null || true
+  rm -rf -- "$work"
+}
 trap cleanup EXIT
 
 archive="$work/3proxy.tar.gz"
@@ -71,30 +77,98 @@ fi
 
 feature_cfg="$work/tls-feature-check.cfg"
 feature_log="$work/tls-feature-check.log"
+feature_tls_log="$work/tls-handshake-check.log"
+feature_parent_log="$work/tls-parent-check.log"
+feature_ca_cert="$work/tls-feature-ca.crt"
+feature_ca_key="$work/tls-feature-ca.key"
+feature_cert="$work/tls-feature-check.crt"
+feature_key="$work/tls-feature-check.key"
+feature_request="$work/tls-feature-check.csr"
+feature_ext="$work/tls-feature-check.cnf"
 feature_port="$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()')"
+feature_parent_port="$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()')"
+openssl req -x509 -newkey rsa:2048 -nodes -sha256 -days 2 \
+  -keyout "$feature_ca_key" -out "$feature_ca_cert" -subj '/CN=3proxy-feature-check-ca' \
+  -addext 'basicConstraints = critical,CA:TRUE' \
+  -addext 'keyUsage = critical,keyCertSign,cRLSign' >/dev/null 2>&1
+openssl req -new -newkey rsa:2048 -nodes -sha256 \
+  -keyout "$feature_key" -out "$feature_request" \
+  -subj '/CN=feature-check.invalid' >/dev/null 2>&1
 printf '%s\n' \
+  '[server_ext]' \
+  'basicConstraints = critical,CA:FALSE' \
+  'keyUsage = critical,digitalSignature,keyEncipherment' \
+  'extendedKeyUsage = serverAuth' \
+  'subjectAltName = IP:127.0.0.1,DNS:feature-check.invalid' > "$feature_ext"
+openssl x509 -req -sha256 -days 2 -in "$feature_request" \
+  -CA "$feature_ca_cert" -CAkey "$feature_ca_key" -CAcreateserial \
+  -extfile "$feature_ext" -extensions server_ext -out "$feature_cert" >/dev/null 2>&1
+printf '%s\n' \
+  "ssl_server_cert $feature_cert" \
+  "ssl_server_key $feature_key" \
+  'ssl_server_min_proto_version TLSv1.2' \
+  'ssl_server_no_verify' \
   'ssl_client_mode 3' \
   'ssl_client_verify' \
-  'ssl_client_ca_file /etc/ssl/certs/ca-certificates.crt' \
+  "ssl_client_ca_file $feature_ca_cert" \
   'ssl_client_sni feature-check.invalid' \
   'ssl_client_min_proto_version TLSv1.2' \
+  'ssl_serv' \
   'ssl_cli' \
   'auth iponly' \
   'allow * 127.0.0.1' \
-  'parent 1000 connect+s 127.0.0.1 9 probe probe' \
+  "parent 1000 connect+s 127.0.0.1 $feature_parent_port" \
   'deny *' \
-  "socks -i127.0.0.1 -p${feature_port}" \
+  "proxy -i127.0.0.1 -p${feature_port}" \
+  'ssl_noserv' \
+  'ssl_nocli' \
   'end' > "$feature_cfg"
-set +e
-timeout 2s "$binary" "$feature_cfg" > "$feature_log" 2>&1
-feature_rc=$?
-set -e
-if [[ $feature_rc -ne 124 ]] \
-    || grep -Eq 'Unknown command:|Command: .* failed|failed to set client context' "$feature_log"; then
+openssl s_server -accept "127.0.0.1:$feature_parent_port" \
+  -cert "$feature_cert" -key "$feature_key" -www -state \
+  < /dev/null > "$feature_parent_log" 2>&1 &
+feature_parent_pid=$!
+for _ in {1..50}; do
+  kill -0 "$feature_parent_pid" 2>/dev/null || break
+  ss -H -ltn "sport = :$feature_parent_port" | grep -q LISTEN && break
+  sleep 0.05
+done
+"$binary" "$feature_cfg" > "$feature_log" 2>&1 &
+feature_pid=$!
+for _ in {1..50}; do
+  kill -0 "$feature_pid" 2>/dev/null || break
+  if timeout 1s openssl s_client -connect "127.0.0.1:$feature_port" \
+      -CAfile "$feature_ca_cert" -verify_ip 127.0.0.1 -verify_return_error \
+      < /dev/null > "$feature_tls_log" 2>&1; then
+    break
+  fi
+  sleep 0.05
+done
+printf 'CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n' \
+  | timeout 3s openssl s_client -quiet -connect "127.0.0.1:$feature_port" \
+      -CAfile "$feature_ca_cert" -verify_ip 127.0.0.1 -verify_return_error \
+      >> "$feature_tls_log" 2>&1 || true
+for _ in {1..50}; do
+  grep -Fq 'CONNECT example.com:443 HTTP/1.1' "$feature_parent_log" && break
+  sleep 0.05
+done
+if ! kill -0 "$feature_pid" 2>/dev/null \
+    || ! kill -0 "$feature_parent_pid" 2>/dev/null \
+    || ! grep -Fq 'Verify return code: 0 (ok)' "$feature_tls_log" \
+    || ! grep -Fq 'SSL_accept:' "$feature_parent_log" \
+    || ! grep -Fq 'CONNECT example.com:443 HTTP/1.1' "$feature_parent_log" \
+    || grep -Eq 'Unknown command:|Command: .* failed|failed to (set|create|read|use)' "$feature_log"; then
   cat "$feature_log" >&2
-  echo "Built 3proxy failed the OpenSSL client runtime smoke test" >&2
+  cat "$feature_tls_log" >&2
+  cat "$feature_parent_log" >&2
+  echo "Built 3proxy failed the combined OpenSSL server/client runtime smoke test" >&2
   exit 1
 fi
+kill "$feature_pid" 2>/dev/null || true
+wait "$feature_pid" 2>/dev/null || true
+feature_pid=""
+kill "$feature_parent_pid" 2>/dev/null || true
+wait "$feature_parent_pid" 2>/dev/null || true
+feature_parent_pid=""
 install -D -m 755 "$binary" /usr/local/bin/3proxy.new
 mv -f /usr/local/bin/3proxy.new /usr/local/bin/3proxy
 
@@ -105,4 +179,4 @@ python3 "$SETUP_ROOT/tools/config.py" write-manifest \
   --version "$version" --source-sha "$source_sha" --patch-sha "$patch_sha" \
   --build-profile "$build_profile" --binary-sha "$binary_sha"
 chmod 644 /usr/local/share/3proxy-build/manifest.json
-echo "==> Installed 3proxy $version with verified OpenSSL client support ($binary_sha)"
+echo "==> Installed 3proxy $version with verified OpenSSL server/client support ($binary_sha)"

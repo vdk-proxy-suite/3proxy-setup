@@ -148,6 +148,39 @@ def make_config(*, mode: str = "strong", include_https: bool = True) -> dict:
     return data
 
 
+def make_matrix_config(*, dns_names: list[str] | None = None) -> dict:
+    data = make_config()
+    data["upstreams"]["socks_primary"]["capabilities"] = ["tcp"]
+    next(
+        listener for listener in data["listeners"] if listener["id"] == "socks_via_socks"
+    )["capabilities"] = ["tcp"]
+    data["tls"] = {
+        "client_ca_file": config_tool.DEFAULT_CLIENT_CA_FILE,
+        "server": {
+            "dns_names": dns_names or [],
+            "validity_days": 365,
+            "ca_validity_days": 3650,
+            "regenerate_on_setup": False,
+        },
+    }
+    data["listeners"].extend(
+        {
+            "id": listener_id,
+            "protocol": "https",
+            "port": port,
+            "parent": parent,
+            "capabilities": ["tcp"],
+        }
+        for listener_id, port, parent in (
+            ("https_direct", 8443, "direct"),
+            ("https_via_socks", 8444, "socks_primary"),
+            ("https_via_http", 8445, "http_primary"),
+            ("https_via_https", 8446, "https_primary"),
+        )
+    )
+    return data
+
+
 class ConfigCliMixin:
     def invoke(self, *args: str) -> tuple[int, str]:
         output = io.StringIO()
@@ -229,6 +262,80 @@ class ValidationTests(unittest.TestCase):
         self.assertIsNone(config_tool.validate(data))
         self.assertEqual(len(data["listeners"]), 8)
 
+    def test_complete_twelve_listener_matrix_is_valid(self) -> None:
+        data = make_matrix_config(dns_names=["proxy.example.test", "alt.example.test"])
+        self.assertIsNone(config_tool.validate(data))
+        self.assertEqual(len(data["listeners"]), 12)
+        self.assertEqual(
+            {
+                (listener["protocol"], listener["parent"])
+                for listener in data["listeners"]
+            },
+            {
+                (protocol, parent)
+                for protocol in ("socks5", "http", "https")
+                for parent in ("direct", "socks_primary", "http_primary", "https_primary")
+            },
+        )
+
+    def test_https_listener_requires_valid_managed_server_tls(self) -> None:
+        missing = make_config()
+        missing["listeners"].append({
+            "id": "https_direct",
+            "protocol": "https",
+            "port": 8443,
+            "parent": "direct",
+            "capabilities": ["tcp"],
+        })
+        with self.assertRaisesRegex(ValueError, "tls.server is required"):
+            config_tool.validate(missing)
+
+        unused = make_config()
+        unused["tls"] = make_matrix_config()["tls"]
+        with self.assertRaisesRegex(ValueError, "only valid when an HTTPS listener"):
+            config_tool.validate(unused)
+
+        cases = [
+            (lambda d: d["tls"].__setitem__("server", []), "tls.server must be a mapping"),
+            (lambda d: d["tls"]["server"].__setitem__("unknown", True), "unsupported tls.server"),
+            (lambda d: d["tls"]["server"].__setitem__("dns_names", "proxy.test"), "must be a list"),
+            (lambda d: d["tls"]["server"].__setitem__("dns_names", ["192.0.2.1"]), "DNS hostname"),
+            (
+                lambda d: d["tls"]["server"].__setitem__(
+                    "dns_names", ["Proxy.example.test", "proxy.example.test"]
+                ),
+                "must not contain duplicates",
+            ),
+            (lambda d: d["tls"]["server"].__setitem__("validity_days", 1), "between 2 and 825"),
+            (lambda d: d["tls"]["server"].__setitem__("validity_days", True), "between 2 and 825"),
+            (lambda d: d["tls"]["server"].__setitem__("ca_validity_days", 1), "between 2 and 3650"),
+            (
+                lambda d: d["tls"]["server"].__setitem__("ca_validity_days", 365),
+                "must exceed validity_days",
+            ),
+            (
+                lambda d: d["tls"]["server"].__setitem__("regenerate_on_setup", 1),
+                "must be boolean",
+            ),
+        ]
+        for mutate, message in cases:
+            with self.subTest(message=message):
+                data = make_matrix_config()
+                mutate(data)
+                with self.assertRaisesRegex(ValueError, message):
+                    config_tool.validate(data)
+
+    def test_https_listener_is_tcp_only_and_client_ca_is_parent_only(self) -> None:
+        udp = make_matrix_config()
+        udp["listeners"][-1]["capabilities"] = ["tcp", "udp"]
+        with self.assertRaisesRegex(ValueError, "TCP only"):
+            config_tool.validate(udp)
+
+        unused_ca = make_config(include_https=False)
+        unused_ca["tls"] = {"client_ca_file": "/etc/ssl/certs/ca-certificates.crt"}
+        with self.assertRaisesRegex(ValueError, "only valid when an HTTPS upstream"):
+            config_tool.validate(unused_ca)
+
     def test_legacy_six_listener_strong_topology_remains_supported(self) -> None:
         data = make_config(include_https=False)
         config_tool.validate(data)
@@ -247,7 +354,8 @@ class ValidationTests(unittest.TestCase):
         self.assertNotIn("auth strong", rendered)
         self.assertEqual(rendered.count("auth iponly"), 6)
         self.assertEqual(rendered.count("allow * 198.51.100.25/32"), 6)
-        self.assertEqual(rendered.count("deny *"), 6)
+        self.assertEqual(rendered.count("\ndeny *\n"), 6)
+        self.assertEqual(rendered.count("deny * * * * UDPASSOC"), 1)
 
     def test_install_server_logging_and_probe_constraints(self) -> None:
         cases = [
@@ -461,7 +569,10 @@ class ValidationTests(unittest.TestCase):
             (lambda d: d["listeners"][1].__setitem__("id", "socks_direct"), "duplicate listener id"),
             (lambda d: d["listeners"][1].__setitem__("port", d["listeners"][0]["port"]), "duplicate listener port"),
             (lambda d: d["listeners"][0].__setitem__("listen_ip", "bad"), None),
-            (lambda d: d["listeners"][0].__setitem__("protocol", "ftp"), "protocol must be socks5 or http"),
+            (
+                lambda d: d["listeners"][0].__setitem__("protocol", "ftp"),
+                "protocol must be socks5, http or https",
+            ),
             (lambda d: d["listeners"][0].__setitem__("parent", "missing"), "undefined upstream missing"),
             (lambda d: d["listeners"][0].__setitem__("parent", None), "undefined upstream None"),
             (lambda d: d["upstreams"].pop("socks_primary"), "undefined upstream socks_primary"),
@@ -559,6 +670,99 @@ class ValidationTests(unittest.TestCase):
 
 
 class RenderingTests(unittest.TestCase):
+    def test_tcp_only_socks_listeners_deny_udp_associate_before_allow_and_parent(self) -> None:
+        data = make_matrix_config()
+        rendered = config_tool.render_3proxy(data)
+        self.assertEqual(rendered.count("deny * * * * UDPASSOC"), 3)
+        direct = rendered[rendered.index("# socks_direct"):rendered.index("# socks_via_socks")]
+        self.assertNotIn("UDPASSOC", direct)
+        for listener_id, next_id in (
+            ("socks_via_socks", "socks_via_http"),
+            ("socks_via_http", "socks_via_https"),
+            ("socks_via_https", "http_direct"),
+        ):
+            block = rendered[rendered.index(f"# {listener_id}"):rendered.index(f"# {next_id}")]
+            self.assertLess(block.index("deny * * * * UDPASSOC"), block.index("allow local-user"))
+            self.assertLess(block.index("deny * * * * UDPASSOC"), block.index("parent 1000"))
+
+        iponly = make_config(mode="iponly", include_https=False)
+        iponly["access"]["allowed_client_cidrs"] = [
+            "198.51.100.25/32",
+            "203.0.113.0/28",
+        ]
+        iponly["upstreams"]["socks_primary"]["capabilities"] = ["tcp"]
+        iponly["listeners"][1]["capabilities"] = ["tcp"]
+        rendered_iponly = config_tool.render_3proxy(iponly)
+        block = rendered_iponly[
+            rendered_iponly.index("# socks_via_socks"):rendered_iponly.index("# socks_via_http")
+        ]
+        self.assertLess(block.index("deny * * * * UDPASSOC"), block.index("allow * 198.51.100.25/32"))
+        route = "parent 1000 socks5 socks.example.test 1080 socks-user socks-password"
+        self.assertIn(
+            "allow * 198.51.100.25/32\n"
+            + route
+            + "\nallow * 203.0.113.0/28\n"
+            + route
+            + "\ndeny *\nsocks ",
+            block,
+        )
+
+    def test_https_listener_matrix_scopes_server_and_parent_tls_independently(self) -> None:
+        data = make_matrix_config(dns_names=["proxy.example.test"])
+        config_tool.validate(data)
+        rendered = config_tool.render_3proxy(data)
+        for directive in (
+            f"ssl_server_cert {config_tool.MANAGED_TLS_SERVER_CERT_FILE}",
+            f"ssl_server_key {config_tool.MANAGED_TLS_SERVER_KEY_FILE}",
+            "ssl_server_min_proto_version TLSv1.2",
+            "ssl_server_no_verify",
+        ):
+            self.assertEqual(rendered.count(directive), 1)
+        self.assertEqual(rendered.count("\nssl_serv\n"), 4)
+        self.assertEqual(rendered.count("\nssl_noserv\n"), 4)
+        self.assertEqual(rendered.count("\nssl_cli\n"), 3)
+        self.assertEqual(rendered.count("\nssl_nocli\n"), 3)
+
+        combined = rendered[rendered.index("# https_via_https"):]
+        expected = (
+            "# https_via_https\n"
+            "ssl_serv\n"
+            "ssl_cli\n"
+            "auth strong\n"
+            "allow local-user\n"
+            "parent 1000 connect+s secure-proxy.example.test 8443 "
+            "https-user https-password\n"
+            "proxy -i0.0.0.0 -p8446\n"
+            "ssl_noserv\n"
+            "ssl_nocli\n"
+            "flush"
+        )
+        self.assertIn(expected, combined)
+
+        https_direct = rendered[
+            rendered.index("# https_direct"):rendered.index("# https_via_socks")
+        ]
+        self.assertIn("ssl_serv", https_direct)
+        self.assertNotIn("ssl_cli", https_direct)
+        self.assertNotIn("parent ", https_direct)
+
+        http_direct = rendered[
+            rendered.index("# http_direct"):rendered.index("# http_via_socks")
+        ]
+        self.assertNotIn("ssl_serv", http_direct)
+        self.assertNotIn("ssl_cli", http_direct)
+
+    def test_managed_leaf_openssl_config_has_ip_and_dns_sans(self) -> None:
+        rendered = config_tool.render_openssl(
+            make_matrix_config(dns_names=["proxy.example.test", "alt.example.test"])
+        )
+        self.assertIn("basicConstraints = critical,CA:FALSE", rendered)
+        self.assertIn("extendedKeyUsage = serverAuth", rendered)
+        self.assertIn("IP.1 = 203.0.113.10", rendered)
+        self.assertIn("DNS.1 = proxy.example.test", rendered)
+        self.assertIn("DNS.2 = alt.example.test", rendered)
+        self.assertTrue(rendered.endswith("\n"))
+
     def test_https_render_uses_verified_tls_and_resets_state_after_each_secure_listener(self) -> None:
         data = make_config()
         config_tool.validate(data)
@@ -576,7 +780,7 @@ class RenderingTests(unittest.TestCase):
 
         socks_https = rendered[rendered.index("# socks_via_https"):rendered.index("# http_direct")]
         self.assertIn(
-            "ssl_cli\nauth strong\nallow local-user\n"
+            "ssl_cli\nauth strong\ndeny * * * * UDPASSOC\nallow local-user\n"
             "parent 1000 connect+s secure-proxy.example.test 8443 https-user https-password\n"
             "socks -i0.0.0.0 -p1083\nssl_nocli\nflush",
             socks_https,
@@ -662,6 +866,32 @@ class CliTests(ConfigCliMixin, unittest.TestCase):
             result, output = self.invoke("firewall-ports", "--config", str(path))
         self.assertEqual(result, 0)
         self.assertEqual(output.splitlines(), ["1081", "1083", "8080", "8081", "8082", "8083"])
+
+    def test_managed_tls_cli_commands_report_and_render_https_listeners(self) -> None:
+        data = make_matrix_config(dns_names=["proxy.example.test", "alt.example.test"])
+        with tempfile.TemporaryDirectory() as directory:
+            path = self.dump_config(directory, data)
+            result, output = self.invoke("has-https-listener", "--config", str(path))
+            self.assertEqual((result, output), (0, "true\n"))
+
+            result, output = self.invoke("https-listeners", "--config", str(path))
+            self.assertEqual(
+                (result, output.splitlines()),
+                (0, ["https_direct", "https_via_socks", "https_via_http", "https_via_https"]),
+            )
+
+            result, output = self.invoke("tls-dns-names", "--config", str(path))
+            self.assertEqual(output.splitlines(), ["proxy.example.test", "alt.example.test"])
+
+            openssl_output = Path(directory) / "leaf.cnf"
+            result, output = self.invoke(
+                "render-openssl", "--config", str(path), "--output", str(openssl_output)
+            )
+            self.assertEqual((result, output), (0, ""))
+            self.assertEqual(
+                openssl_output.read_text(encoding="utf-8"),
+                config_tool.render_openssl(data),
+            )
 
     def test_external_udp_reflects_only_non_loopback_udp_listeners(self) -> None:
         data = make_config()

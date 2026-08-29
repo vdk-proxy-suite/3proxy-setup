@@ -6,17 +6,20 @@ parse_config_arg "$@"
 
 timestamp="$(date -u +%Y%m%dT%H%M%SZ)"
 BACKUP_DIR="$BACKUP_ROOT/$timestamp"
+umask 077
 install -d -m 700 "$BACKUP_DIR"
 
 [[ -f /usr/local/bin/3proxy ]] && cp -a /usr/local/bin/3proxy "$BACKUP_DIR/3proxy"
 [[ -f /etc/3proxy/3proxy.cfg ]] && cp -a /etc/3proxy/3proxy.cfg "$BACKUP_DIR/3proxy.cfg"
+[[ -f /etc/3proxy/setup.yaml ]] && cp -a /etc/3proxy/setup.yaml "$BACKUP_DIR/setup.yaml"
+[[ -d /etc/3proxy/tls ]] && cp -a /etc/3proxy/tls "$BACKUP_DIR/tls"
 [[ -f /etc/systemd/system/3proxy.service ]] && cp -a /etc/systemd/system/3proxy.service "$BACKUP_DIR/3proxy.service"
 [[ -f /usr/local/share/3proxy-build/manifest.json ]] && cp -a /usr/local/share/3proxy-build/manifest.json "$BACKUP_DIR/build-manifest.json"
-install -m 600 "$CONFIG" "$BACKUP_DIR/config.yaml"
+install -m 600 "$CONFIG" "$BACKUP_DIR/requested-config.yaml"
 
 (
   cd "$BACKUP_DIR"
-  sha256sum ./* > SHA256SUMS
+  find . -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS
 )
 printf 'BACKUP_DIR=%s\n' "$BACKUP_DIR" > "$STATE_FILE"
 chmod 600 "$STATE_FILE"

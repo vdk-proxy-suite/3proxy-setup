@@ -24,6 +24,12 @@ local_auth:
 
 tls:
   client_ca_file: "/etc/ssl/certs/ca-certificates.crt"
+  server:
+    dns_names:
+      - "proxy-vm.example.com"
+    validity_days: 365
+    ca_validity_days: 3650
+    regenerate_on_setup: false
 
 upstreams:
   https_primary:
@@ -47,6 +53,12 @@ listeners:
     protocol: "http"
     listen_ip: "0.0.0.0"
     port: 8082
+    parent: "https_primary"
+    capabilities: [tcp]
+  - id: "public_https_tls"
+    protocol: "https"
+    listen_ip: "0.0.0.0"
+    port: 8443
     parent: "https_primary"
     capabilities: [tcp]
   - id: "local_socks_tls"

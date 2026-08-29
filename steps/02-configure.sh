@@ -1,11 +1,13 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/common.sh"
+source "$SETUP_ROOT/lib/tls.sh"
 require_root
 parse_config_arg "$@"
 
 getent group proxy-observability >/dev/null || groupadd --system proxy-observability
 install -d -m 755 /etc/3proxy
+prepare_managed_tls
 install -d -o root -g proxy-observability -m 2750 /var/log/3proxy
 touch /var/log/3proxy/3proxy.log
 chown root:proxy-observability /var/log/3proxy/3proxy.log
