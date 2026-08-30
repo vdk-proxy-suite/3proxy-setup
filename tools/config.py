@@ -105,6 +105,32 @@ def listener_ip(data: dict[str, Any], listener: dict[str, Any]) -> str:
     return str(listener.get("listen_ip", data["server"]["listen_ip"]))
 
 
+def effective_listener_access(data: dict[str, Any], listener: dict[str, Any]) -> dict[str, Any]:
+    if "access" in listener:
+        return dict(listener["access"])
+    return dict(data.get("access", {}))
+
+
+def validate_access(access: Any, name: str) -> str:
+    if not isinstance(access, dict):
+        raise ValueError(f"{name} must be a mapping")
+    mode = access.get("mode", "strong")
+    if mode not in {"strong", "iponly"}:
+        raise ValueError(f"{name}.mode must be strong or iponly")
+    allowed_client_cidrs = access.get("allowed_client_cidrs", [])
+    if not isinstance(allowed_client_cidrs, list):
+        raise ValueError(f"{name}.allowed_client_cidrs must be a list")
+    if mode == "iponly" and not allowed_client_cidrs:
+        raise ValueError(f"iponly access requires at least one allowed client CIDR ({name})")
+    for index, value in enumerate(allowed_client_cidrs):
+        network = ipaddress.ip_network(str(value), strict=False)
+        if network.version != 4:
+            raise ValueError(f"{name}.allowed_client_cidrs[{index}] must be IPv4")
+        if network.prefixlen == 0:
+            raise ValueError(f"iponly access must not allow an open /0 network ({name})")
+    return mode
+
+
 def capability_set(value: Any, name: str, *, allow_udp: bool) -> set[str]:
     if not isinstance(value, list) or not value or any(not isinstance(item, str) for item in value):
         raise ValueError(f"{name} must be a non-empty list")
@@ -220,31 +246,7 @@ def validate(data: dict[str, Any]) -> None:
         raise ValueError("logging.compress must be boolean")
 
     access = data.get("access", {})
-    if not isinstance(access, dict):
-        raise ValueError("access must be a mapping")
-    mode = access.get("mode", "strong")
-    if mode not in {"strong", "iponly"}:
-        raise ValueError("access.mode must be strong or iponly")
-    allowed_client_cidrs = access.get("allowed_client_cidrs", [])
-    if not isinstance(allowed_client_cidrs, list):
-        raise ValueError("access.allowed_client_cidrs must be a list")
-    if mode == "iponly" and not allowed_client_cidrs:
-        raise ValueError("iponly access requires at least one allowed client CIDR")
-    for index, value in enumerate(allowed_client_cidrs):
-        network = ipaddress.ip_network(str(value), strict=False)
-        if network.version != 4:
-            raise ValueError(f"access.allowed_client_cidrs[{index}] must be IPv4")
-        if network.prefixlen == 0:
-            raise ValueError("iponly access must not allow an open /0 network")
-
-    local = data.get("local_auth")
-    if mode == "strong":
-        if not isinstance(local, dict):
-            raise ValueError("local_auth must be a mapping in strong mode")
-        safe_token(local.get("username"), "local_auth.username")
-        safe_token(local.get("password"), "local_auth.password")
-    elif local is not None and not isinstance(local, dict):
-        raise ValueError("local_auth must be a mapping when provided")
+    validate_access(access, "access")
 
     upstreams = data.get("upstreams", {})
     if not isinstance(upstreams, dict):
@@ -309,6 +311,21 @@ def validate(data: dict[str, Any]) -> None:
         ports.add(port)
         ipaddress.ip_address(listener_ip(data, item))
     for listener_id, item in by_id.items():
+        if "access" in item:
+            access_override = item["access"]
+            if not isinstance(access_override, dict):
+                raise ValueError(f"listener {listener_id}.access must be a mapping")
+            unknown_access = set(access_override) - {"mode", "allowed_client_cidrs"}
+            if unknown_access:
+                raise ValueError(
+                    f"unsupported listener {listener_id}.access settings: {sorted(unknown_access)}"
+                )
+            if "mode" not in access_override:
+                raise ValueError(f"listener {listener_id}.access.mode is required")
+        validate_access(
+            effective_listener_access(data, item),
+            f"listener {listener_id}.access",
+        )
         protocol = item.get("protocol")
         if protocol not in SUPPORTED_LISTENER_PROTOCOLS:
             raise ValueError(f"listener {listener_id} protocol must be socks5, http or https")
@@ -324,6 +341,19 @@ def validate(data: dict[str, Any]) -> None:
             parent_capabilities = set(upstreams[parent]["capabilities"])
             if not listener_capabilities <= parent_capabilities:
                 raise ValueError(f"listener {listener_id} capabilities exceed upstream {parent}")
+
+    local = data.get("local_auth")
+    strong_listener_present = any(
+        effective_listener_access(data, item).get("mode", "strong") == "strong"
+        for item in listeners
+    )
+    if strong_listener_present:
+        if not isinstance(local, dict):
+            raise ValueError("local_auth must be a mapping when any listener uses strong mode")
+        safe_token(local.get("username"), "local_auth.username")
+        safe_token(local.get("password"), "local_auth.password")
+    elif local is not None and not isinstance(local, dict):
+        raise ValueError("local_auth must be a mapping when provided")
     if has_https_listener(data) and tls_server_config(data) is None:
         raise ValueError("tls.server is required when an HTTPS listener is configured")
     if tls_server_config(data) is not None and not has_https_listener(data):
@@ -350,11 +380,13 @@ def parent_line(data: dict[str, Any], name: str) -> str:
 
 
 def render_3proxy(data: dict[str, Any]) -> str:
-    access = data.get("access", {})
-    mode = access.get("mode", "strong")
     local_auth = data.get("local_auth", {})
     user = local_auth.get("username")
     password = local_auth.get("password")
+    strong_listener_present = any(
+        effective_listener_access(data, listener).get("mode", "strong") == "strong"
+        for listener in data["listeners"]
+    )
     public_ip = data["server"]["public_ip"]
     logging = data.get("logging", {})
     keep_files = logging.get("keep_files", 14)
@@ -369,7 +401,7 @@ def render_3proxy(data: dict[str, Any]) -> str:
         'logformat "-|+_Gv1|%t|%.|%D|%N|%p|%E|%U|%C|%c|%R|%r|%Q|%q|%n|%O|%I|%h|%T"',
         "timeouts 1 5 30 60 180 1800 15 60 15 5",
         "maxconn 1000",
-        *([f"users {user}:CL:{password}"] if mode == "strong" else []),
+        *([f"users {user}:CL:{password}"] if strong_listener_present else []),
         "",
     ]
     if has_https_listener(data):
@@ -394,6 +426,8 @@ def render_3proxy(data: dict[str, Any]) -> str:
         ])
     for listener in sorted(data["listeners"], key=lambda item: item["port"]):
         lines.append(f"# {listener['id']}")
+        access = effective_listener_access(data, listener)
+        mode = access.get("mode", "strong")
         secure_listener = listener["protocol"] == "https"
         secure_parent = (
             listener["parent"] != "direct"

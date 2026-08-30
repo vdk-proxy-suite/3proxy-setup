@@ -1,9 +1,17 @@
-# Standalone 3proxy setup 2.1.1
+# Standalone 3proxy setup 2.2.0
 
 Пакет устанавливает 3proxy 1.0.0 из проверенного tag-архива, собирает основной
 binary с обязательным OpenSSL client support, создаёт выбранные listeners и
 запускает health-check. Рассчитан на Ubuntu/Debian с `apt-get`, `systemd` и
 доступом в интернет.
+
+Версия 2.2.0 добавляет необязательный `listeners[].access`: без этого поля
+listener наследует весь глобальный access block, а при наличии локальный block
+полностью его заменяет и требует явный `mode`. Это позволяет сохранить
+публичные listeners в `strong`, а отдельный loopback SOCKS listener перевести в `iponly` для
+локального HAProxy. Healthcheck использует фактический режим каждого listener
+и для `iponly` SOCKS дополнительно выполняет обязательный raw SOCKS4 CONNECT
+без аутентификации. Версия установленного 3proxy остаётся закреплена на 1.0.0.
 
 Версия 2.1.1 исправляет build-time проверки без изменения YAML или runtime
 топологии. Patchset digest теперь зависит только от имён и содержимого патчей,
@@ -93,10 +101,15 @@ OpenSSL binary допустим штатный `reconfigure`. Первый по�
 пути patchset digest; новый manifest остаётся одинаковым при переносе setup в
 другой каталог.
 
+Переход с 2.1.1 на 2.2.0 не требует пересборки binary и не меняет существующие
+renders: listeners без собственного `access` продолжают наследовать глобальный
+режим. Для добавления mixed-access listener достаточно штатного `reconfigure`.
+
 В `config.yaml` замените:
 
 - `server.public_ip` на публичный IPv4 VM
-- `local_auth` на локальные credentials прокси при `access.mode: strong`
+- `local_auth` на локальные credentials прокси, если хотя бы один listener
+  фактически использует `strong`
 - адреса, порты и credentials используемых upstream
 - `expected_egress_ip` на ожидаемый внешний IP каждого upstream
 
@@ -163,6 +176,10 @@ listeners:
     port: 11080
     parent: "https_primary"
     capabilities: [tcp]
+    access:
+      mode: "iponly"
+      allowed_client_cidrs:
+        - "127.0.0.1/32"
 ```
 
 Полная схема находится в `config.matrix.example.yaml`:
@@ -260,6 +277,46 @@ IPv4. В режиме `iponly` требуется непустой allowlist, `/
 заканчивается `deny *`. `local_auth` и `upstreams` полностью direct-профилю не
 нужны.
 
+Глобальный `access` остаётся default для всех listeners. Если
+`listeners[].access` отсутствует, listener наследует global block целиком. Если
+поле присутствует, оно полностью заменяет global block для этого listener,
+обязано явно содержать `mode` и самостоятельно задавать
+`allowed_client_cidrs` для `iponly`. Типичный локальный адаптер к проверяемому
+HTTPS parent выглядит так:
+
+```yaml
+access:
+  mode: "strong"
+
+local_auth:
+  username: "PUBLIC_USER"
+  password: "PUBLIC_PASSWORD"
+
+listeners:
+  - id: "whatsapp_media_bridge"
+    protocol: "socks5"
+    listen_ip: "127.0.0.1"
+    port: 11081
+    parent: "https_primary"
+    capabilities: [tcp]
+    access:
+      mode: "iponly"
+      allowed_client_cidrs:
+        - "127.0.0.1/32"
+```
+
+Renderer оставляет остальные listeners в `strong`, а для этого блока создаёт
+`auth iponly`, loopback allow и завершающий `deny *`. Loopback bind не
+публикуется через UFW. `protocol: socks5` выбирает сервис `socks` 3proxy,
+который принимает и SOCKS5, и SOCKS4; strong listeners проверяются по SOCKS5 с
+credentials, а effective-`iponly` listeners — по SOCKS5 no-auth и отдельному
+raw SOCKS4 no-auth probe.
+
+SOCKS4 передаёт destination как IPv4, а не hostname. Поэтому HAProxy или
+healthcheck сначала разрешает DNS локально, а HTTPS parent затем получает
+`CONNECT <IPv4>:<port>`. Если требуется именно remote DNS или hostname в
+CONNECT authority, этот SOCKS4 adapter такую семантику не предоставляет.
+
 `monitor_v1` использует машинно-читаемый logformat, ежедневную встроенную
 ротацию, gzip и группу `proxy-observability` для непривилегированного read-only
 мониторинга. Старый журнал при первом переключении сохраняется как
@@ -316,7 +373,8 @@ ID считается ошибкой.
 При `--scope vm` local-only listener проверяется через его loopback bind. При
 `--scope e2e` он явно помечается `N/A`, потому что с внешней машины недоступен.
 HTTPS upstream проверяется отдельными TLS HTTP GET и CONNECT probes с тем же SNI,
-CA trust и минимумом TLS 1.2.
+CA trust и минимумом TLS 1.2. Для effective-`iponly` SOCKS listener результат
+raw SOCKS4 probe обязателен и отдельно отображается как `socks4_tcp`.
 
 Перед общим healthcheck шаг 3 обязательно запускает для каждого HTTPS listener
 TLS gate. Его можно повторить вручную:

@@ -220,6 +220,55 @@ class TcpProbeTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "target HTTP response"):
                 healthcheck.socks_tcp("proxy", 1080, None, None, "target", 80, 2)
 
+    def test_socks4_tcp_sends_raw_ipv4_noauth_connect_and_http_probe(self) -> None:
+        sock = FakeStreamSocket(
+            b"\x00\x5a\x00\x00\x00\x00\x00\x00",
+            b"HTTP/1.1 200 OK\r\nContent-Length: 13\r\n\r\n198.51.100.44",
+            b"",
+        )
+        with mock.patch.object(
+                healthcheck.socket,
+                "gethostbyname",
+                return_value="192.0.2.50",
+            ) as resolve, mock.patch.object(
+                healthcheck.socket,
+                "create_connection",
+                return_value=sock,
+            ) as create:
+            result = healthcheck.socks4_tcp(
+                "127.0.0.1",
+                11081,
+                "api.ipify.org",
+                443,
+                3.5,
+            )
+        self.assertEqual(result, "198.51.100.44")
+        resolve.assert_called_once_with("api.ipify.org")
+        create.assert_called_once_with(("127.0.0.1", 11081), timeout=3.5)
+        self.assertEqual(
+            bytes(sock.sent)[:9],
+            b"\x04\x01\x01\xbb\xc0\x00\x02\x32\x00",
+        )
+        self.assertTrue(
+            bytes(sock.sent).endswith(
+                b"GET / HTTP/1.1\r\nHost: api.ipify.org\r\nConnection: close\r\n\r\n"
+            )
+        )
+
+    def test_socks4_tcp_rejects_failed_connect_reply(self) -> None:
+        sock = FakeStreamSocket(b"\x00\x5b\x00\x00\x00\x00\x00\x00")
+        with mock.patch.object(
+                healthcheck.socket,
+                "gethostbyname",
+                return_value="192.0.2.50",
+            ), mock.patch.object(
+                healthcheck.socket,
+                "create_connection",
+                return_value=sock,
+            ):
+            with self.assertRaisesRegex(RuntimeError, "SOCKS4 CONNECT failed"):
+                healthcheck.socks4_tcp("127.0.0.1", 11081, "api.ipify.org", 80, 2)
+
     def test_proxy_authorization_supports_auth_and_noauth(self) -> None:
         self.assertEqual(healthcheck.proxy_authorization(None, None), "")
         expected = base64.b64encode(b"alice:secret").decode()
@@ -639,6 +688,18 @@ class ResultAndScopeTests(unittest.TestCase):
                     public_ip,
                 )
 
+    def test_listener_effective_access_controls_credentials(self) -> None:
+        config = make_health_config()
+        inherited = {"id": "public"}
+        iponly = {"id": "bridge", "access": {"mode": "iponly"}}
+        self.assertEqual(healthcheck.effective_listener_access_mode(config, inherited), "strong")
+        self.assertEqual(
+            healthcheck.listener_credentials(config, inherited),
+            ("local-user", "local-password"),
+        )
+        self.assertEqual(healthcheck.effective_listener_access_mode(config, iponly), "iponly")
+        self.assertEqual(healthcheck.listener_credentials(config, iponly), (None, None))
+
     def test_add_listener_na_emits_protocol_specific_checks(self) -> None:
         results: list[dict] = []
         healthcheck.add_listener_na(
@@ -648,6 +709,11 @@ class ResultAndScopeTests(unittest.TestCase):
         healthcheck.add_listener_na(
             results,
             {"id": "socks_tcp", "protocol": "socks5", "capabilities": ["tcp"]},
+        )
+        healthcheck.add_listener_na(
+            results,
+            {"id": "socks4_iponly", "protocol": "socks5", "capabilities": ["tcp"]},
+            "iponly",
         )
         healthcheck.add_listener_na(
             results,
@@ -665,6 +731,9 @@ class ResultAndScopeTests(unittest.TestCase):
                 ("socks", "udp_stun", "N/A", False),
                 ("socks_tcp", "tcp", "N/A", False),
                 ("socks_tcp", "udp_rejected", "N/A", False),
+                ("socks4_iponly", "tcp", "N/A", False),
+                ("socks4_iponly", "socks4_tcp", "N/A", False),
+                ("socks4_iponly", "udp_rejected", "N/A", False),
                 ("http", "http_get", "N/A", False),
                 ("http", "http_connect", "N/A", False),
                 ("https", "tls_handshake", "N/A", False),
@@ -676,6 +745,60 @@ class ResultAndScopeTests(unittest.TestCase):
 
 
 class MainTests(HealthcheckMainMixin, unittest.TestCase):
+    def test_mixed_access_listener_uses_noauth_and_adds_raw_socks4_probe(self) -> None:
+        config = make_health_config()
+        config["upstreams"]["https_primary"] = {
+            "type": "https",
+            "host": "secure.example",
+            "port": 8443,
+            "tls_server_name": "secure.example",
+            "expected_egress_ip": "198.51.100.20",
+        }
+        config["listeners"] = [
+            {
+                "id": "whatsapp_media_bridge",
+                "protocol": "socks5",
+                "port": 11081,
+                "parent": "https_primary",
+                "listen_ip": "127.0.0.1",
+                "capabilities": ["tcp"],
+                "access": {
+                    "mode": "iponly",
+                    "allowed_client_cidrs": ["127.0.0.1/32"],
+                },
+            }
+        ]
+        with mock.patch.object(
+                healthcheck,
+                "socks_tcp",
+                return_value="198.51.100.20",
+            ) as socks5, mock.patch.object(
+                healthcheck,
+                "socks4_tcp",
+                return_value="198.51.100.20",
+            ) as socks4, mock.patch.object(
+                healthcheck,
+                "socks_udp_rejected",
+                return_value="UDP ASSOCIATE rejected, status=2",
+            ) as udp_rejected:
+            result, output = self.invoke(
+                config,
+                "--scope",
+                "vm",
+                "--endpoint",
+                "whatsapp_media_bridge",
+            )
+        self.assertEqual(result, 0)
+        socks5.assert_called_once_with(
+            "127.0.0.1", 11081, None, None, "api.ipify.org", 80, 8.0
+        )
+        socks4.assert_called_once_with(
+            "127.0.0.1", 11081, "api.ipify.org", 80, 8.0
+        )
+        udp_rejected.assert_called_once_with("127.0.0.1", 11081, None, None, 8.0)
+        self.assertIn("socks4_tcp", output)
+        self.assertIn("SUMMARY endpoints=1 passed=3 failed=0 n/a=0", output)
+
     def test_unknown_or_skipped_endpoint_is_rejected(self) -> None:
         config = make_health_config()
         config["upstreams"]["http_primary"] = {

@@ -255,6 +255,19 @@ class PrimitiveApiTests(unittest.TestCase):
         self.assertEqual(config_tool.client_ca_file(data), "/opt/ca/custom.pem")
         self.assertEqual(config_tool.listener_ip(data, listener), "127.0.0.1")
 
+    def test_effective_listener_access_inherits_only_when_override_is_absent(self) -> None:
+        data = make_config(mode="iponly")
+        listener = data["listeners"][0]
+        self.assertEqual(
+            config_tool.effective_listener_access(data, listener),
+            data["access"],
+        )
+        listener["access"] = {"mode": "strong"}
+        self.assertEqual(
+            config_tool.effective_listener_access(data, listener),
+            {"mode": "strong"},
+        )
+
 
 class ValidationTests(unittest.TestCase):
     def test_complete_v2_topology_is_valid(self) -> None:
@@ -437,12 +450,45 @@ class ValidationTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, message):
                     config_tool.validate(data)
 
+        listener_cases = [
+            ([], "must be a mapping"),
+            (None, "must be a mapping"),
+            ({}, "mode is required"),
+            (
+                {"allowed_client_cidrs": ["127.0.0.1/32"]},
+                "mode is required",
+            ),
+            ({"mode": "open"}, "strong or iponly"),
+            ({"mode": "iponly"}, "at least one"),
+            (
+                {"mode": "iponly", "allowed_client_cidrs": ["0.0.0.0/0"]},
+                "open /0",
+            ),
+            ({"mode": "iponly", "unknown": True}, "unsupported listener"),
+        ]
+        for override, message in listener_cases:
+            with self.subTest(listener_override=override):
+                data = make_config()
+                data["listeners"][0]["access"] = override
+                with self.assertRaisesRegex(ValueError, message):
+                    config_tool.validate(data)
+
         for cidrs, message in (([], "at least one"), (["0.0.0.0/0"], "open /0"), (["2001:db8::/64"], "must be IPv4")):
             with self.subTest(cidrs=cidrs):
                 data = make_config(mode="iponly")
                 data["access"]["allowed_client_cidrs"] = cidrs
                 with self.assertRaisesRegex(ValueError, message):
                     config_tool.validate(data)
+
+        mixed = make_config(mode="iponly")
+        mixed["listeners"][0]["access"] = {"mode": "strong"}
+        with self.assertRaisesRegex(ValueError, "any listener uses strong"):
+            config_tool.validate(mixed)
+        mixed["local_auth"] = {
+            "username": "local-user",
+            "password": "local-password",
+        }
+        config_tool.validate(mixed)
 
     def test_upstream_credentials_are_optional_but_must_be_paired_and_safe(self) -> None:
         data = make_config()
@@ -670,6 +716,36 @@ class ValidationTests(unittest.TestCase):
 
 
 class RenderingTests(unittest.TestCase):
+    def test_listener_access_override_renders_mixed_strong_and_loopback_iponly(self) -> None:
+        data = make_config()
+        bridge = next(
+            listener for listener in data["listeners"] if listener["id"] == "socks_via_https"
+        )
+        bridge["listen_ip"] = "127.0.0.1"
+        bridge["access"] = {
+            "mode": "iponly",
+            "allowed_client_cidrs": ["127.0.0.1/32"],
+        }
+        config_tool.validate(data)
+        rendered = config_tool.render_3proxy(data)
+        block = rendered[
+            rendered.index("# socks_via_https"):rendered.index("# http_direct")
+        ]
+        self.assertEqual(rendered.count("users local-user:CL:local-password"), 1)
+        self.assertEqual(rendered.count("auth iponly"), 1)
+        self.assertEqual(rendered.count("auth strong"), len(data["listeners"]) - 1)
+        self.assertIn(
+            "auth iponly\n"
+            "deny * * * * UDPASSOC\n"
+            "allow * 127.0.0.1/32\n"
+            "parent 1000 connect+s secure-proxy.example.test 8443 "
+            "https-user https-password\n"
+            "deny *\n"
+            "socks -i127.0.0.1 -p1083",
+            block,
+        )
+        self.assertNotIn("allow local-user", block)
+
     def test_tcp_only_socks_listeners_deny_udp_associate_before_allow_and_parent(self) -> None:
         data = make_matrix_config()
         rendered = config_tool.render_3proxy(data)

@@ -91,6 +91,33 @@ def socks_tcp(proxy: str, port: int, user: str | None, password: str | None, tar
     return body.decode(errors="replace")
 
 
+def socks4_tcp(
+    proxy: str,
+    port: int,
+    target: str,
+    target_port: int,
+    timeout: float,
+) -> str:
+    target_ipv4 = socket.gethostbyname(target)
+    with socket.create_connection((proxy, port), timeout=timeout) as sock:
+        sock.settimeout(timeout)
+        sock.sendall(
+            b"\x04\x01"
+            + struct.pack("!H", target_port)
+            + socket.inet_aton(target_ipv4)
+            + b"\x00"
+        )
+        version, status = recv_exact(sock, 2)
+        recv_exact(sock, 6)
+        if version != 0 or status != 0x5A:
+            raise RuntimeError(f"SOCKS4 CONNECT failed, status={status}")
+        sock.sendall(f"GET / HTTP/1.1\r\nHost: {target}\r\nConnection: close\r\n\r\n".encode())
+        response_status, body = read_http_response(sock)
+    if " 200 " not in response_status:
+        raise RuntimeError(f"target HTTP response: {response_status}")
+    return body.decode(errors="replace")
+
+
 def proxy_authorization(user: str | None, password: str | None) -> str:
     if user is None:
         return ""
@@ -416,11 +443,33 @@ def listener_vm_bind_probe_host(listener: dict[str, Any], default_listen_ip: str
     return bind_ip
 
 
-def add_listener_na(results: list[dict[str, Any]], listener: dict[str, Any]) -> None:
+def effective_listener_access_mode(config: dict[str, Any], listener: dict[str, Any]) -> str:
+    if "access" in listener:
+        return listener["access"]["mode"]
+    return config.get("access", {}).get("mode", "strong")
+
+
+def listener_credentials(
+    config: dict[str, Any],
+    listener: dict[str, Any],
+) -> tuple[str | None, str | None]:
+    if effective_listener_access_mode(config, listener) != "strong":
+        return None, None
+    local_auth = config.get("local_auth", {})
+    return local_auth.get("username"), local_auth.get("password")
+
+
+def add_listener_na(
+    results: list[dict[str, Any]],
+    listener: dict[str, Any],
+    access_mode: str = "strong",
+) -> None:
     endpoint = listener["id"]
     reason = "local-only listener is reachable only from the VM"
     if listener["protocol"] == "socks5":
         add_na(results, endpoint, "tcp", reason)
+        if access_mode == "iponly":
+            add_na(results, endpoint, "socks4_tcp", reason)
         add_na(
             results,
             endpoint,
@@ -466,10 +515,6 @@ def main() -> int:
     timeout = args.timeout or float(config["probes"]["timeout_seconds"])
     public_ip = config["server"]["public_ip"]
     default_listen_ip = config["server"]["listen_ip"]
-    access_mode = config.get("access", {}).get("mode", "strong")
-    local_auth = config.get("local_auth", {})
-    local_user = local_auth.get("username") if access_mode == "strong" else None
-    local_password = local_auth.get("password") if access_mode == "strong" else None
     http_host = config["probes"]["http_host"]
     http_port = int(config["probes"]["http_port"])
     dns_host = config["probes"]["dns_server"]
@@ -505,16 +550,29 @@ def main() -> int:
         parent = listener["parent"]
         expected = public_ip if parent == "direct" else config["upstreams"][parent]["expected_egress_ip"]
         port = int(listener["port"])
+        access_mode = effective_listener_access_mode(config, listener)
+        local_user, local_password = listener_credentials(config, listener)
         probe_host = listener_probe_host(listener, args.scope, public_ip, default_listen_ip)
         if args.tls_gate_only and args.scope == "vm":
             probe_host = listener_vm_bind_probe_host(listener, default_listen_ip)
         if probe_host is None:
-            add_listener_na(results, listener)
+            add_listener_na(results, listener, access_mode)
             continue
         if listener["protocol"] == "socks5":
             run_check(results, endpoint, "tcp", True, expected, lambda p=port: socks_tcp(
                 probe_host, p, local_user, local_password, http_host, http_port, timeout
             ))
+            if access_mode == "iponly":
+                run_check(
+                    results,
+                    endpoint,
+                    "socks4_tcp",
+                    True,
+                    expected,
+                    lambda p=port: socks4_tcp(
+                        probe_host, p, http_host, http_port, timeout
+                    ),
+                )
             if "udp" in listener["capabilities"]:
                 run_check(results, endpoint, "udp_dns", True, None, lambda p=port: dns_probe(
                     probe_host, p, local_user, local_password, dns_host, dns_port, timeout

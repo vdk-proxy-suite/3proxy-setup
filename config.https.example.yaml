@@ -67,6 +67,10 @@ listeners:
     port: 11080
     parent: "https_primary"
     capabilities: [tcp]
+    access:
+      mode: "iponly"
+      allowed_client_cidrs:
+        - "127.0.0.1/32"
 
 probes:
   timeout_seconds: 8

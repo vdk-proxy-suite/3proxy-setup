@@ -727,6 +727,27 @@ class GeneratedHttpsBridgeRuntimeTests(unittest.TestCase):
             response = _recv_exact(client, expected_size)
         return response
 
+    def _socks4_noauth_connect(
+        self,
+        proxy_port: int,
+        target_port: int,
+        payload: bytes,
+    ) -> bytes:
+        with socket.create_connection(("127.0.0.1", proxy_port), timeout=3) as client:
+            client.settimeout(5)
+            client.sendall(
+                b"\x04\x01"
+                + target_port.to_bytes(2, "big")
+                + socket.inet_aton("127.0.0.1")
+                + b"\x00"
+            )
+            version, status = _recv_exact(client, 2)
+            _recv_exact(client, 6)
+            self.assertEqual((version, status), (0, 0x5A))
+            client.sendall(payload)
+            response = _recv_exact(client, len(SENTINEL_PREFIX) + len(payload))
+        return response
+
     def _socks_udp_associate_status(self, proxy_port: int) -> int | None:
         username = DUMMY_LOCAL_USER.encode("utf-8")
         password = DUMMY_LOCAL_PASSWORD.encode("utf-8")
@@ -1158,6 +1179,100 @@ class GeneratedHttpsBridgeRuntimeTests(unittest.TestCase):
             )
             self.assertEqual(sentinel.hit_count, 2)
             self.assertEqual(sentinel.payloads, [first_payload, second_payload])
+            self.assertFalse(parent.tls_errors, parent.tls_errors)
+            self.assertFalse(parent.errors, parent.errors)
+
+    def test_mixed_strong_and_loopback_iponly_socks4_share_verified_https_parent(self) -> None:
+        strong_port = _unused_loopback_port()
+        bridge_port = _unused_loopback_port()
+        while bridge_port == strong_port:
+            bridge_port = _unused_loopback_port()
+        strong_port, bridge_port = sorted((strong_port, bridge_port))
+        listeners: list[dict[str, object]] = [
+            {
+                "id": "secure-socks.strong",
+                "protocol": "socks5",
+                "listen_ip": "127.0.0.1",
+                "port": strong_port,
+                "parent": "https_primary",
+                "capabilities": ["tcp"],
+            },
+            {
+                "id": "whatsapp-media.socks4",
+                "protocol": "socks5",
+                "listen_ip": "127.0.0.1",
+                "port": bridge_port,
+                "parent": "https_primary",
+                "capabilities": ["tcp"],
+                "access": {
+                    "mode": "iponly",
+                    "allowed_client_cidrs": ["127.0.0.1/32"],
+                },
+            },
+        ]
+        strong_payload = b"mixed-strong-socks5"
+        bridge_payload = b"mixed-iponly-socks4"
+        with _SentinelTarget() as sentinel, _TlsConnectParent(
+            self.server_certificate,
+            self.server_key,
+            ("127.0.0.1", sentinel.port),
+        ) as parent:
+            with self._running_proxy(
+                "mixed-strong-iponly-socks4",
+                strong_port,
+                parent.port,
+                self.ca_certificate,
+                listeners=listeners,
+            ) as running:
+                rendered = running.config_path.read_text(encoding="utf-8")
+                strong_block = rendered[
+                    rendered.index("# secure-socks.strong"):
+                    rendered.index("# whatsapp-media.socks4")
+                ]
+                bridge_block = rendered[rendered.index("# whatsapp-media.socks4"):]
+                self.assertEqual(
+                    rendered.count(
+                        f"users {DUMMY_LOCAL_USER}:CL:{DUMMY_LOCAL_PASSWORD}"
+                    ),
+                    1,
+                )
+                self.assertIn("auth strong", strong_block)
+                self.assertIn(f"allow {DUMMY_LOCAL_USER}", strong_block)
+                self.assertIn(
+                    "auth iponly\n"
+                    "deny * * * * UDPASSOC\n"
+                    "allow * 127.0.0.1/32\n",
+                    bridge_block,
+                )
+                self.assertIn("\ndeny *\nsocks -i127.0.0.1", bridge_block)
+                self.assertNotIn(f"allow {DUMMY_LOCAL_USER}", bridge_block)
+
+                strong_response = self._socks_connect(
+                    strong_port,
+                    sentinel.port,
+                    strong_payload,
+                )
+                bridge_response = self._socks4_noauth_connect(
+                    bridge_port,
+                    sentinel.port,
+                    bridge_payload,
+                )
+                self.assertEqual(strong_response, SENTINEL_PREFIX + strong_payload)
+                self.assertEqual(bridge_response, SENTINEL_PREFIX + bridge_payload)
+
+            self._assert_tls_only(parent)
+            self.assertEqual(parent.tls_sessions, 2)
+            self.assertEqual(parent.sni_names.count(GOOD_PARENT_NAME), 2)
+            expected_authorization = _basic_value(
+                DUMMY_UPSTREAM_USER,
+                DUMMY_UPSTREAM_PASSWORD,
+            )
+            self.assertEqual(parent.authorization_values.count(expected_authorization), 2)
+            self.assertEqual(
+                parent.connect_targets,
+                [("127.0.0.1", sentinel.port), ("127.0.0.1", sentinel.port)],
+            )
+            self.assertEqual(sentinel.payloads, [strong_payload, bridge_payload])
             self.assertFalse(parent.tls_errors, parent.tls_errors)
             self.assertFalse(parent.errors, parent.errors)
 
