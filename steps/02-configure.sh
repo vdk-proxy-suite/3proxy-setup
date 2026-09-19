@@ -4,6 +4,7 @@ source "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/common.sh"
 source "$SETUP_ROOT/lib/tls.sh"
 require_root
 parse_config_arg --check-listeners "$@"
+python3 "$SETUP_ROOT/tools/acme.py" preflight --config "$CONFIG"
 
 systemctl stop "$SERVICE" 2>/dev/null || true
 if systemctl is-active --quiet "$SERVICE"; then echo "Selected service is still active" >&2; exit 1; fi

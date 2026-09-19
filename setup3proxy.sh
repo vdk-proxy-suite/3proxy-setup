@@ -17,6 +17,9 @@ fi
 source "$BASE_DIR/lib/common.sh"
 settings="$(python3 "$BASE_DIR/tools/instance.py" env "$@")"
 eval "$settings"
+if ! python3 "$BASE_DIR/tools/operation_lock.py" check "$INSTANCE_ID"; then
+  exec python3 "$BASE_DIR/tools/operation_lock.py" run "$INSTANCE_ID" bash "$0" "$ACTION" "$@"
+fi
 python3 "$BASE_DIR/tools/config.py" validate --config "$CONFIG"
 case "$ACTION" in
   status|start|stop)
@@ -30,6 +33,9 @@ prepare_args=()
 case "$ACTION" in all|update|reconfigure|2) prepare_args+=(--check-listeners) ;; esac
 case "$ACTION" in backup|rollback) ;; *) python3 "$BASE_DIR/tools/instance.py" prepare "${prepare_args[@]}" "$@" ;; esac
 case "$ACTION" in backup|rollback) ;; *) CONFIG="$INSTANCE_STATE/requested.yaml" ;; esac
+case "$ACTION" in
+  all|update|reconfigure|2) python3 "$BASE_DIR/tools/acme.py" preflight --config "$CONFIG" ;;
+esac
 step_args=(--config "$CONFIG")
 [[ -n "$INSTANCE_ID" ]] || step_args+=(--legacy)
 case "$ACTION" in backup|rollback) step_args+=(--existing) ;; esac

@@ -152,6 +152,8 @@ prepare_managed_tls() {
   install -d -m 755 "$(dirname "$MANAGED_TLS_DIR")"
   if [[ "$(python3 "$SETUP_ROOT/tools/config.py" tls-server-mode --config "$CONFIG")" == external ]]; then
     python3 "$SETUP_ROOT/tools/tls_material.py" --config "$CONFIG" --directory "$MANAGED_TLS_DIR"
+  elif [[ "$(python3 "$SETUP_ROOT/tools/config.py" tls-server-mode --config "$CONFIG")" == acme_ip ]]; then
+    python3 "$SETUP_ROOT/tools/acme.py" install --config "$CONFIG"
   else
     install_managed_tls_directory
   fi

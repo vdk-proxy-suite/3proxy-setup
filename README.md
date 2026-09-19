@@ -1,4 +1,4 @@
-# Standalone 3proxy setup 2.4.0
+# Standalone 3proxy setup 2.5.0
 
 Upstream: [3proxy/3proxy](https://github.com/3proxy/3proxy).
 
@@ -6,6 +6,9 @@ Upstream: [3proxy/3proxy](https://github.com/3proxy/3proxy).
 binary с обязательным OpenSSL client support, создаёт выбранные listeners и
 запускает health-check. Рассчитан на Ubuntu/Debian с `apt-get`, `systemd` и
 доступом в интернет.
+
+Версия 2.5.0 добавляет YAML ACME IP: отдельное фоновое renewal и применение
+нового сертификата с restart instance только в 05:00 Europe/Moscow.
 
 Версия 2.4.0 добавляет явный режим внешней серверной цепочки и ключа
 `tls.server.mode: external`. Цепочка, IP SAN, срок и соответствие ключа проверяются
@@ -328,6 +331,117 @@ frontend status не считается доказательством успе�
 listeners. Порты listeners должны быть уникальны; loopback listener не создаёт
 публичное UFW-правило. Установщик намеренно не зависит от приложения, которое
 будет использовать конкретный listener.
+
+## ACME IP и применение сертификата в 05:00 МСК (2.5.0)
+
+`config.acme.example.yaml` задаёт полностью управляемую установщиком политику:
+
+```yaml
+tls:
+  server:
+    mode: acme_ip
+    acme:
+      environment: production
+      agree_tos: true
+      email: admin@example.com
+      profile: shortlived
+      challenge: http-01
+      renewal:
+        enabled: true
+        interval_minutes: 60
+      deploy:
+        time: '05:00'
+        timezone: Europe/Moscow
+      cleanup:
+        retain_state: false
+```
+
+Нужен named `instance.id`, Python 3.10+ и закреплённый публичный IP из
+`server.public_ip`. Первичная выдача выполняется до остановки существующего
+instance. Для HTTP-01 снаружи должен быть доступен TCP 80; правила cloud SG
+задаются отдельно. Установщик не останавливает чужой webserver ради challenge
+и не открывает TCP 443/587. Конфликт TCP 80 приводит к ошибке выдачи и повторной
+попытке, а не к остановке чужого процесса. Свои challenges сериализуются.
+
+Certbot **5.8.0** устанавливается в отдельный venv instance из закреплённого
+`tools/certbot-requirements.txt` с обязательной проверкой hashes. Системный
+Python и уже установленные общие пакеты не обновляются. При необходимости
+устанавливаются только отсутствующие `python3-venv`, `ca-certificates`,
+`openssl` с прежней проверкой apt solver. Стандартные настройки pip mirror или
+локального wheelhouse допускаются, но проверка hashes остаётся обязательной.
+
+Работают два отдельных root-owned timer/service:
+
+- `3proxy-ID-acme-renew.timer`: по умолчанию проверка каждые 60 минут, после
+  boot — через 5 минут, jitter до 60 секунд. Certbot сам определяет необходимость
+  renewal с shortlived/ARI-политикой; `force-renewal` не используется
+- `3proxy-ID-acme-deploy.timer`: каждый день в 05:00 `Europe/Moscow`, без
+  случайной задержки и без догоняющего запуска пропущенного окна
+
+Renewal получает новый leaf и новый ключ, проверяет их и сохраняет **кандидата**.
+Он не меняет активную пару и не вызывает reload/restart. В окне 05:00–05:01
+deploy повторно проверяет кандидата и только при изменении сертификата
+перезапускает выбранный instance. Все его текущие соединения будут прерваны;
+соседние instances и отдельный Telemt-egress не затрагиваются. Остановленный
+пользователем instance автоматика не запускает. После restart проверяются все
+HTTPS listeners: цепочка, IP identity и fingerprint реально отдаваемого leaf.
+Ошибка применения восстанавливает предыдущую пару с restart и проверкой.
+
+Новый сертификат, полученный после окна, ждёт следующего дня. Если блокировка
+обслуживания задержала deploy за пределы окна, дневного restart не будет.
+Угроза истечения срока требует реакции оператора; скрытого аварийного дневного
+restart нет. Получение файлов на диск не считается успешным применением.
+Let’s Encrypt IP shortlived действует 160 часов, поэтому контролируется срок
+**реально отдаваемого** сертификата: warning менее 48 часов, critical менее 24.
+Также проверяются timers, давность renewal check и расхождение disk/served leaf.
+
+Первый setup, явная смена IP и переход staging → production устанавливают первоначальный
+сертификат в рамках вызванного оператором lifecycle. Обычный reconfigure
+сохраняет активный leaf, даже если уже есть новый кандидат; выключение
+`renewal.enabled` отключает оба timer, сохраняя сертификат. Повторное включение
+не вызывает немедленного применения вне 05:00. Setup, отдельные steps, cleanup
+и ACME jobs сериализованы одной блокировкой instance. Её небольшой root-owned
+файл в /run/lock сохраняется до reboot, чтобы cleanup не создал гонку между
+старой и новой блокировками; общий HTTP-01 lock также не удаляется cleanup.
+
+ACME account, Certbot state, venv, кандидат и status находятся в
+`/var/lib/3proxy-acme/instances/ID/` с root-only доступом. Manifest и ownership
+marker защищают от чужих ресурсов; допускаются только известные Certbot links
+внутри своего archive и стандартная ссылка venv `lib64`. Активная пара остаётся
+в `CONFIG_DIR/tls`. Контроллер и lock/roots-файлы устанавливаются вместе с
+управляющими скриптами, поэтому удаление распаковки не ломает jobs.
+
+Backup/rollback включают активный TLS, кандидат, status, timer/service files
+и их enabled/active состояние. История выдачи и account Certbot сохраняются
+в своём ACME root. Cleanup сначала проверяет все ownership, затем удаляет свои
+units и venv. По умолчанию account/certificates/renewal state удаляются;
+`cleanup.retain_state: true` явно сохраняет их с ownership marker и root-only
+доступом. ACME file logs, как и прочие логи, удаляются только с `--purge-logs`.
+ОС-пакеты и общий журнал не очищаются.
+
+`environment: staging` использует отдельный account/state и отдельный bundled
+набор официальных тестовых roots. Они никогда не добавляются в системное
+хранилище. Staging не заменяет существующий non-staging listener: проверяйте
+его в отдельном instance. Такой сертификат не доказывает публичного доверия;
+production leaf проходит системную проверку CA без тестовых roots.
+
+Диагностика установленного instance (без исходной распаковки):
+
+```bash
+sudo python3 /usr/local/lib/3proxy-setup/instances/main/tools/acme.py status --instance main
+sudo python3 /usr/local/lib/3proxy-setup/instances/main/tools/acme.py renew --instance main
+sudo python3 /usr/local/lib/3proxy-setup/instances/main/tools/acme.py deploy --instance main
+```
+
+`deploy` вне окна ничего не применяет. `status` возвращает JSON и ненулевой код
+при warning/critical. Общий VM healthcheck включает ACME lifecycle; TLS gate
+по-прежнему проверяет только протокол/identity. Production E2E использует CA
+клиентской машины; staging E2E требует явно передать тестовый CA через
+`--proxy-ca-file`. Проверка AdGuard Android проводится отдельно при DEP.
+
+Источники: [IP shortlived](https://letsencrypt.org/2026/01/15/6day-and-ip-general-availability),
+[Certbot renewal](https://eff-certbot.readthedocs.io/en/stable/using.html#renewing-certificates),
+[отдельное доверие staging](https://letsencrypt.org/docs/staging-environment/).
 
 ## Внешний fullchain/key для HTTPS listeners (2.4.0)
 

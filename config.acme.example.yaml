@@ -1,0 +1,95 @@
+# Fictional IP and credentials. HTTP-01 requires reachable TCP 80.
+instance:
+  id: main
+install:
+  version: 1.0.0
+  source_url: https://github.com/3proxy/3proxy/archive/refs/tags/1.0.0.tar.gz
+  sha256: 35b07de1046f3aaeac4a7085101b7e5c453efa3527cbdc42a84690366c7ecfa8
+server:
+  public_ip: 203.0.113.10
+  listen_ip: 0.0.0.0
+  udp_client_cidr: 127.0.0.1/32
+  manage_ufw: false
+logging:
+  format: monitor_v1
+  rotation: daily
+  keep_files: 14
+  compress: true
+access:
+  mode: strong
+local_auth:
+  username: CHANGE_ME_LOCAL
+  password: CHANGE_ME_LOCAL
+tls:
+  client_ca_file: /etc/ssl/certs/ca-certificates.crt
+  server:
+    mode: acme_ip
+    acme:
+      environment: production
+      agree_tos: true
+      email: admin@example.com
+      profile: shortlived
+      challenge: http-01
+      renewal:
+        enabled: true
+        interval_minutes: 60
+      deploy:
+        time: 05:00
+        timezone: Europe/Moscow
+      cleanup:
+        retain_state: false
+upstreams:
+  https_primary:
+    type: https
+    host: proxy.example.com
+    port: 8443
+    username: CHANGE_ME_UPSTREAM
+    password: CHANGE_ME_UPSTREAM
+    tls_server_name: proxy.example.com
+    expected_egress_ip: 198.51.100.20
+    capabilities:
+    - tcp
+listeners:
+- id: public_socks_tls
+  protocol: socks5
+  listen_ip: 0.0.0.0
+  port: 1082
+  parent: https_primary
+  capabilities:
+  - tcp
+- id: public_http_tls
+  protocol: http
+  listen_ip: 0.0.0.0
+  port: 8082
+  parent: https_primary
+  capabilities:
+  - tcp
+- id: public_https_tls
+  protocol: https
+  listen_ip: 0.0.0.0
+  port: 8443
+  parent: https_primary
+  capabilities:
+  - tcp
+- id: local_socks_tls
+  protocol: socks5
+  listen_ip: 127.0.0.1
+  port: 11080
+  parent: https_primary
+  capabilities:
+  - tcp
+  access:
+    mode: iponly
+    allowed_client_cidrs:
+    - 127.0.0.1/32
+probes:
+  timeout_seconds: 8
+  http_host: api.ipify.org
+  http_port: 80
+  dns_server: 1.1.1.1
+  dns_port: 53
+  stun_servers:
+  - host: stun.l.google.com
+    port: 19302
+  - host: stun.cloudflare.com
+    port: 3478

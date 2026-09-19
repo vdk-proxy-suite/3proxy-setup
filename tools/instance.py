@@ -162,6 +162,8 @@ def check_ports(p: dict, config: Path) -> None:
 
 
 def verify_unit(p: dict, manifest: dict) -> None:
+    from acme import verify_owned
+    verify_owned(p, manifest)
     unit = Path(p["UNIT_FILE"])
     guard(unit)
     if Path(p["UNIT_FILE"] + ".d").exists():
@@ -255,7 +257,7 @@ WantedBy=multi-user.target
     server_bundle = None
     if tls_server_mode(normalized_config) == "external":
         server_bundle = collect_server_tls(normalized_config, Path(p["INSTANCE_STATE"]) / "pending-server-tls")
-    elif normalized_config.get("tls", {}).get("server") is not None and (Path(p["CONFIG_DIR"]) / "tls" / "mode").exists() and normalized_config.get("tls", {}).get("server", {}).get("mode") != "managed":
+    elif tls_server_mode(normalized_config) == "managed" and normalized_config.get("tls", {}).get("server") is not None and (Path(p["CONFIG_DIR"]) / "tls" / "mode").exists() and normalized_config.get("tls", {}).get("server", {}).get("mode") != "managed":
         raise ValueError("switching external TLS to managed requires explicit tls.server.mode: managed")
     supplied_ca = normalized_config.get("tls", {}).get("client_ca_file")
     managed_ca = Path(p["CONFIG_DIR"]) / "client-ca.crt"
@@ -304,7 +306,7 @@ WantedBy=multi-user.target
     if source.resolve() != target:
         names = ["setup3proxy.sh", "clean3proxy.sh", "VERSION"]
         names += [str(f.relative_to(source)) for d in ("lib", "steps", "tools", "patches")
-                  for f in (source / d).glob("*") if f.is_file() and f.suffix in (".sh", ".py", ".patch", ".md")]
+                  for f in (source / d).glob("*") if f.is_file() and f.suffix in (".sh", ".py", ".patch", ".md", ".txt")]
         for name in names:
             src, dst = source / name, target / name
             if src.is_symlink():
@@ -472,10 +474,13 @@ def cleanup(p: dict, args: argparse.Namespace) -> None:
         from firewall import purge
         # Validate every rule (including later records) before stopping the unit.
         purge(p, manifest, execute=False)
+    from acme import cleanup as cleanup_acme
+    cleanup_acme(p, manifest, execute=False, purge_logs=args.purge_logs)
     if not args.yes or args.dry_run:
         return
     if os.geteuid() != 0:
         raise ValueError("real cleanup requires root")
+    cleanup_acme(p, manifest, execute=True, purge_logs=args.purge_logs)
     subprocess.run(["systemctl", "disable", "--now", p["SERVICE"]], check=False)
     active = subprocess.run(["systemctl", "is-active", "--quiet", p["SERVICE"]]).returncode
     if active == 0:
@@ -513,8 +518,8 @@ def cleanup(p: dict, args: argparse.Namespace) -> None:
     subprocess.run(["systemctl", "reset-failed", p["SERVICE"]], check=False)
 
 
-def install_dependencies() -> None:
-    packages = ["build-essential", "cmake", "curl", "ca-certificates", "libssl-dev",
+def install_dependencies(packages: list[str] | None = None) -> None:
+    packages = packages or ["build-essential", "cmake", "curl", "ca-certificates", "libssl-dev",
                 "openssl", "patch", "python3-yaml", "iproute2"]
     missing = []
     for package in packages:
@@ -585,7 +590,9 @@ def main() -> int:
             raise ValueError("configuration is required")
         prepare(p, config, args.source, args.update_existing, check_listeners=args.check_listeners)
     else:
-        cleanup(p, args)
+        from operation_lock import acquire
+        with acquire(p["INSTANCE_ID"]):
+            cleanup(p, args)
     return 0
 
 

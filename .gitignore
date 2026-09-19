@@ -6,6 +6,7 @@ config*.yaml
 !config.https.example.yaml
 !config.matrix.example.yaml
 !config.external-tls.example.yaml
+!config.acme.example.yaml
 .env
 .env.*
 !.env.example

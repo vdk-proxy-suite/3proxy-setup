@@ -540,7 +540,7 @@ def main() -> int:
         if listener["protocol"] == "https"
         and (args.endpoint is None or args.endpoint == listener["id"])
     ]
-    external_tls = config.get("tls", {}).get("server", {}).get("mode", "managed") == "external"
+    external_tls = config.get("tls", {}).get("server", {}).get("mode", "managed") in ("external", "acme_ip")
     if args.scope == "e2e" and selected_https_listeners and args.proxy_ca_file is None and not external_tls:
         parser.error(
             "--proxy-ca-file is required for HTTPS-listener E2E; copy the VM's "
@@ -555,6 +555,10 @@ def main() -> int:
         # An E2E client's trust store belongs to that client, not a VM-side path.
         proxy_ca_file = None if args.scope == "e2e" else config["tls"]["server"].get("ca_file", "/etc/ssl/certs/ca-certificates.crt")
 
+
+    if config.get("tls", {}).get("server", {}).get("mode") == "acme_ip" and args.scope == "vm" and args.proxy_ca_file is None:
+        from acme import trust_file
+        proxy_ca_file = str(trust_file(config))
 
     for listener in config["listeners"]:
         endpoint = listener["id"]
@@ -687,6 +691,16 @@ def main() -> int:
                 host, port, user, password, http_host, http_port, timeout,
                 tls_server_name=server_name, ca_file=ca_file
             ))
+
+    if config.get("tls", {}).get("server", {}).get("mode") == "acme_ip" and args.scope == "vm" and not args.tls_gate_only and args.endpoint is None:
+        def acme_state():
+            from acme import status
+            from instance import paths
+            report = status(paths(config["instance"]["id"]), config)
+            if report["state"] != "ok":
+                raise ValueError("ACME " + report["state"] + ": " + json.dumps(report))
+            return json.dumps(report)
+        run_check(results, "acme", "certificate_lifecycle", True, None, acme_state)
 
     for result in results:
         suffix = result.get("detail") or result.get("error") or ""

@@ -114,8 +114,12 @@ def server_ca_file(data: dict[str, Any]) -> str:
 
 def validate_tls_server(server: dict[str, Any]) -> None:
     mode = server.get("mode", "managed")
-    if mode not in {"managed", "external"}:
-        raise ValueError("tls.server.mode must be managed or external")
+    if mode == "acme_ip":
+        from acme_config import validate as validate_acme
+        validate_acme(server)
+        return
+    if not isinstance(mode, str) or mode not in {"managed", "external"}:
+        raise ValueError("tls.server.mode must be managed, external or acme_ip")
     if mode == "external":
         unknown = set(server) - {"mode", "fullchain_file", "private_key_file", "ca_file"}
         if unknown:
@@ -279,6 +283,8 @@ def validate(data: dict[str, Any]) -> None:
         if not isinstance(tls_server, dict):
             raise ValueError("tls.server must be a mapping")
         validate_tls_server(tls_server)
+        if tls_server.get("mode") == "acme_ip" and "instance" not in data:
+            raise ValueError("ACME requires a named instance.id")
 
     logging = data.get("logging", {})
     if not isinstance(logging, dict):

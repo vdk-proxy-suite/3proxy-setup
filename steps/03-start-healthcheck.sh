@@ -28,6 +28,8 @@ if [[ "$https_listener_state" == "true" ]]; then
   done <<< "$https_listener_ids"
 fi
 
+python3 "$SETUP_ROOT/tools/acme.py" configure --config "$CONFIG"
+
 install -d -m 755 ${LOG_DIR}/healthchecks
 stamp="$(date -u +%Y%m%dT%H%M%SZ)"
 report="${LOG_DIR}/healthchecks/$stamp.json"

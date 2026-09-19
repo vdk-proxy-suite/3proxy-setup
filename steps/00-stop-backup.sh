@@ -17,6 +17,7 @@ install -d -m 700 "$BACKUP_DIR"
 [[ -f ${UNIT_FILE} ]] && cp -a ${UNIT_FILE} "$BACKUP_DIR/3proxy.service"
 [[ -f ${BUILD_MANIFEST} ]] && cp -a ${BUILD_MANIFEST} "$BACKUP_DIR/build-manifest.json"
 install -m 600 "$CONFIG" "$BACKUP_DIR/requested-config.yaml"
+python3 "$SETUP_ROOT/tools/acme.py" backup --config "$CONFIG" --directory "$BACKUP_DIR"
 if systemctl is-active --quiet "$SERVICE"; then touch "$BACKUP_DIR/active"; fi
 if systemctl is-enabled --quiet "$SERVICE"; then touch "$BACKUP_DIR/enabled"; fi
 

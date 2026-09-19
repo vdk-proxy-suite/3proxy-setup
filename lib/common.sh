@@ -16,6 +16,9 @@ parse_config_arg() {
   local settings
   settings="$(python3 "$SETUP_ROOT/tools/instance.py" env "$@")"
   eval "$settings"
+  if ! python3 "$SETUP_ROOT/tools/operation_lock.py" check "$INSTANCE_ID"; then
+    exec python3 "$SETUP_ROOT/tools/operation_lock.py" run "$INSTANCE_ID" bash "$0" "$@"
+  fi
   require_file "$CONFIG"
   python3 "$SETUP_ROOT/tools/config.py" validate --config "$CONFIG"
   local operation=prepare argument
@@ -78,6 +81,7 @@ restore_latest_backup() {
   else
     rm -f -- ${BUILD_MANIFEST}
   fi
+  python3 "$SETUP_ROOT/tools/acme.py" rollback --config "$CONFIG" --directory "$BACKUP_DIR"
   systemctl daemon-reload
   if [[ -f ${UNIT_FILE} ]]; then
     if [[ -f "$BACKUP_DIR/enabled" ]]; then

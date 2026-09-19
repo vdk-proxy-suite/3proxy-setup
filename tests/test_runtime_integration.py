@@ -1341,6 +1341,29 @@ class GeneratedHttpsBridgeRuntimeTests(unittest.TestCase):
             self.assertFalse(parent.tls_errors, parent.tls_errors)
             self.assertFalse(parent.errors, parent.errors)
 
+    def test_expired_https_parent_rejects_without_direct_fallback(self) -> None:
+        ca, certificate, key = self._generate_certificate_chain("expired-parent", GOOD_PARENT_NAME)
+        directory = certificate.parent
+        self._run_openssl("x509", "-req", "-in", str(directory/"leaf.csr"),
+                          "-CA", str(ca), "-CAkey", str(directory/"ca.key"),
+                          "-set_serial", "991", "-days", "-1", "-sha256",
+                          "-extfile", str(directory/"leaf.cnf"), "-extensions", "server_ext",
+                          "-out", str(certificate))
+        port = _unused_loopback_port()
+        with _SentinelTarget() as sentinel, _TlsConnectParent(
+                certificate, key, ("127.0.0.1", sentinel.port)) as parent:
+            with self._running_proxy("expired-parent-proxy", port, parent.port, ca) as running:
+                result = self._proxy_connect(port, sentinel.port,
+                    (DUMMY_LOCAL_USER, DUMMY_LOCAL_PASSWORD), b"expired-must-not-pass")
+                self.assertTrue(parent.wait_for_attempt(), running.diagnostics())
+                self.assertFalse(result.status is not None and 200 <= result.status < 300,
+                                 running.diagnostics())
+            self._assert_tls_only(parent)
+            self.assertEqual(parent.tls_sessions, 0)
+            self.assertEqual(parent.requests, [])
+            self.assertEqual(sentinel.hit_count, 0)
+            self.assertFalse(parent.errors, parent.errors)
+
     def test_wrong_ca_rejects_parent_and_never_reaches_target(self) -> None:
         listener_port = _unused_loopback_port()
         payload = b"must-not-pass-wrong-ca"
