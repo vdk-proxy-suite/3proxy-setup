@@ -150,5 +150,9 @@ prepare_managed_tls() {
     return 1
   }
   install -d -m 755 "$(dirname "$MANAGED_TLS_DIR")"
-  install_managed_tls_directory
+  if [[ "$(python3 "$SETUP_ROOT/tools/config.py" tls-server-mode --config "$CONFIG")" == external ]]; then
+    python3 "$SETUP_ROOT/tools/tls_material.py" --config "$CONFIG" --directory "$MANAGED_TLS_DIR"
+  else
+    install_managed_tls_directory
+  fi
 }

@@ -1005,6 +1005,22 @@ class MainTests(HealthcheckMainMixin, unittest.TestCase):
         self.assertEqual(connect.call_args.kwargs, get.call_args.kwargs)
         self.assertIn("SUMMARY endpoints=1 passed=4 failed=0 n/a=0", output)
 
+    def test_external_tls_uses_vm_ca_and_client_system_trust(self) -> None:
+        config = make_health_config()
+        config["tls"] = {"server": {"mode": "external", "ca_file": "/vm/private-trust.crt"}}
+        config["listeners"] = [{"id": "external", "protocol": "https", "port": 8443,
+                                 "parent": "direct", "capabilities": ["tcp"]}]
+        for scope, expected in (("vm", "/vm/private-trust.crt"), ("e2e", None)):
+            with self.subTest(scope=scope), \
+                    mock.patch.object(healthcheck, "tls_handshake", return_value="TLSv1.3") as handshake, \
+                    mock.patch.object(healthcheck, "plaintext_proxy_rejected", return_value="rejected"), \
+                    mock.patch.object(healthcheck, "http_get", return_value="203.0.113.10"), \
+                    mock.patch.object(healthcheck, "http_connect", return_value="203.0.113.10"):
+                result, _ = self.invoke(config, "--scope", scope)
+                self.assertEqual(result, 0)
+                self.assertEqual(handshake.call_args.kwargs["ca_file"], expected)
+                self.assertEqual(handshake.call_args.kwargs["tls_server_name"], "203.0.113.10")
+
     def test_iponly_listener_uses_noauth_and_https_parent_expected_egress(self) -> None:
         config = make_health_config(mode="iponly")
         config["upstreams"]["https_primary"] = {

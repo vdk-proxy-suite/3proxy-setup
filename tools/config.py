@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import ipaddress
 import json
+import os
 import posixpath
 import re
 from pathlib import Path
@@ -43,6 +44,12 @@ def load_config(path: Path) -> dict[str, Any]:
         supplied = Path(tls["client_ca_file"])
         if not supplied.is_absolute() and not tls["client_ca_file"].startswith("/") :
             tls["client_ca_file"] = (path.resolve().parent / supplied).resolve().as_posix()
+    server = tls.get("server") if isinstance(tls, dict) else None
+    if isinstance(server, dict):
+        for key in ("fullchain_file", "private_key_file", "ca_file"):
+            value = server.get(key)
+            if isinstance(value, str) and value and not value.startswith("/") and not Path(value).is_absolute():
+                server[key] = Path(os.path.abspath(path.parent / value)).as_posix()
     return data
 
 
@@ -93,6 +100,70 @@ def tls_server_config(data: dict[str, Any]) -> dict[str, Any] | None:
     server = tls.get("server") if isinstance(tls, dict) else None
     return server if isinstance(server, dict) else None
 
+
+
+def tls_server_mode(data: dict[str, Any]) -> str:
+    return (tls_server_config(data) or {}).get("mode", "managed")
+
+
+def server_ca_file(data: dict[str, Any]) -> str:
+    if tls_server_mode(data) == "external":
+        return data["tls"]["server"].get("ca_file", DEFAULT_CLIENT_CA_FILE)
+    return f"{paths(data.get('instance', {}).get('id'))['CONFIG_DIR']}/tls/ca.crt"
+
+
+def validate_tls_server(server: dict[str, Any]) -> None:
+    mode = server.get("mode", "managed")
+    if mode not in {"managed", "external"}:
+        raise ValueError("tls.server.mode must be managed or external")
+    if mode == "external":
+        unknown = set(server) - {"mode", "fullchain_file", "private_key_file", "ca_file"}
+        if unknown:
+            raise ValueError(f"unsupported external tls.server settings: {sorted(unknown)}")
+        for key in ("fullchain_file", "private_key_file", "ca_file"):
+            value = server.get(key, DEFAULT_CLIENT_CA_FILE if key == "ca_file" else None)
+            safe_token(value, f"tls.server.{key}", colon=False)
+            if not (value.startswith("/") or Path(value).is_absolute()) or value == "/" or posixpath.normpath(value) != value or "//" in value:
+                raise ValueError(f"tls.server.{key} must be an absolute normalized path")
+        return
+    validate_managed_tls_server(server)
+
+
+
+def validate_managed_tls_server(tls_server: dict[str, Any]) -> None:
+    unknown_server_tls = set(tls_server) - {
+        "mode", "dns_names", "validity_days", "ca_validity_days", "regenerate_on_setup"
+    }
+    if unknown_server_tls:
+        raise ValueError(f"unsupported tls.server settings: {sorted(unknown_server_tls)}")
+    dns_names = tls_server.get("dns_names")
+    if not isinstance(dns_names, list) or any(not isinstance(name, str) for name in dns_names):
+        raise ValueError("tls.server.dns_names must be a list of DNS hostnames")
+    normalized_dns_names: set[str] = set()
+    for index, value in enumerate(dns_names):
+        name = dns_hostname(value, f"tls.server.dns_names[{index}]")
+        normalized = name.lower()
+        if normalized in normalized_dns_names:
+            raise ValueError("tls.server.dns_names must not contain duplicates")
+        normalized_dns_names.add(normalized)
+    validity_days = tls_server.get("validity_days")
+    if (
+        isinstance(validity_days, bool)
+        or not isinstance(validity_days, int)
+        or not 2 <= validity_days <= 825
+    ):
+        raise ValueError("tls.server.validity_days must be between 2 and 825")
+    ca_validity_days = tls_server.get("ca_validity_days")
+    if (
+        isinstance(ca_validity_days, bool)
+        or not isinstance(ca_validity_days, int)
+        or not 2 <= ca_validity_days <= 3650
+    ):
+        raise ValueError("tls.server.ca_validity_days must be between 2 and 3650")
+    if ca_validity_days <= validity_days:
+        raise ValueError("tls.server.ca_validity_days must exceed validity_days")
+    if not isinstance(tls_server.get("regenerate_on_setup"), bool):
+        raise ValueError("tls.server.regenerate_on_setup must be boolean")
 
 def has_https_parent(data: dict[str, Any]) -> bool:
     return any(
@@ -207,39 +278,7 @@ def validate(data: dict[str, Any]) -> None:
     if tls_server is not None:
         if not isinstance(tls_server, dict):
             raise ValueError("tls.server must be a mapping")
-        unknown_server_tls = set(tls_server) - {
-            "dns_names", "validity_days", "ca_validity_days", "regenerate_on_setup"
-        }
-        if unknown_server_tls:
-            raise ValueError(f"unsupported tls.server settings: {sorted(unknown_server_tls)}")
-        dns_names = tls_server.get("dns_names")
-        if not isinstance(dns_names, list) or any(not isinstance(name, str) for name in dns_names):
-            raise ValueError("tls.server.dns_names must be a list of DNS hostnames")
-        normalized_dns_names: set[str] = set()
-        for index, value in enumerate(dns_names):
-            name = dns_hostname(value, f"tls.server.dns_names[{index}]")
-            normalized = name.lower()
-            if normalized in normalized_dns_names:
-                raise ValueError("tls.server.dns_names must not contain duplicates")
-            normalized_dns_names.add(normalized)
-        validity_days = tls_server.get("validity_days")
-        if (
-            isinstance(validity_days, bool)
-            or not isinstance(validity_days, int)
-            or not 2 <= validity_days <= 825
-        ):
-            raise ValueError("tls.server.validity_days must be between 2 and 825")
-        ca_validity_days = tls_server.get("ca_validity_days")
-        if (
-            isinstance(ca_validity_days, bool)
-            or not isinstance(ca_validity_days, int)
-            or not 2 <= ca_validity_days <= 3650
-        ):
-            raise ValueError("tls.server.ca_validity_days must be between 2 and 3650")
-        if ca_validity_days <= validity_days:
-            raise ValueError("tls.server.ca_validity_days must exceed validity_days")
-        if not isinstance(tls_server.get("regenerate_on_setup"), bool):
-            raise ValueError("tls.server.regenerate_on_setup must be boolean")
+        validate_tls_server(tls_server)
 
     logging = data.get("logging", {})
     if not isinstance(logging, dict):
@@ -544,7 +583,7 @@ def main() -> int:
     sub = parser.add_subparsers(dest="command", required=True)
     config_commands = {
         "validate", "get", "render-3proxy", "render-openssl", "ports", "firewall-ports",
-        "external-udp", "has-https-listener", "https-listeners", "tls-dns-names",
+        "tls-server-mode", "external-udp", "has-https-listener", "https-listeners", "tls-dns-names",
     }
     for name in sorted(config_commands):
         item = sub.add_parser(name)
@@ -601,10 +640,12 @@ def main() -> int:
         for item in sorted(data["listeners"], key=lambda value: value["port"]):
             if item["protocol"] == "https":
                 print(item["id"])
+    elif args.command == "tls-server-mode":
+        print(tls_server_mode(data))
     elif args.command == "tls-dns-names":
         server_tls = tls_server_config(data)
         if server_tls is not None:
-            for name in server_tls["dns_names"]:
+            for name in server_tls.get("dns_names", []):
                 print(name)
     elif args.command == "manifest-matches":
         try:

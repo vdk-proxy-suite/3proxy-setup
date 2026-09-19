@@ -5,6 +5,7 @@ config*.yaml
 !config.iponly.example.yaml
 !config.https.example.yaml
 !config.matrix.example.yaml
+!config.external-tls.example.yaml
 .env
 .env.*
 !.env.example

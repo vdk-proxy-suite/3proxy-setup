@@ -250,6 +250,13 @@ WantedBy=multi-user.target
     from config import load_config, validate
     normalized_config = load_config(config)
     validate(normalized_config)
+    from tls_material import collect as collect_server_tls, stage as stage_server_tls
+    from config import tls_server_mode
+    server_bundle = None
+    if tls_server_mode(normalized_config) == "external":
+        server_bundle = collect_server_tls(normalized_config, Path(p["INSTANCE_STATE"]) / "pending-server-tls")
+    elif normalized_config.get("tls", {}).get("server") is not None and (Path(p["CONFIG_DIR"]) / "tls" / "mode").exists() and normalized_config.get("tls", {}).get("server", {}).get("mode") != "managed":
+        raise ValueError("switching external TLS to managed requires explicit tls.server.mode: managed")
     supplied_ca = normalized_config.get("tls", {}).get("client_ca_file")
     managed_ca = Path(p["CONFIG_DIR"]) / "client-ca.crt"
     ca_bytes = None
@@ -278,6 +285,8 @@ WantedBy=multi-user.target
         guard(pending_ca)
         pending_ca.write_bytes(ca_bytes)
         pending_ca.chmod(0o600)
+    if server_bundle is not None:
+        stage_server_tls(normalized_config, p, server_bundle)
     snapshot.write_text(yaml.safe_dump(normalized_config, sort_keys=False), encoding="utf-8")
     snapshot.chmod(0o600)
     marker = source / ".3proxy-instance.json"
@@ -436,7 +445,7 @@ def cleanup(p: dict, args: argparse.Namespace) -> None:
             # Never delete /var/log/3proxy/instances or unrelated files.
             removable.extend(str(f) for f in Path(p["LOG_DIR"]).glob("3proxy.log*") if f.is_file())
             removable.append(str(Path(p["LOG_DIR"]) / "healthchecks"))
-    for file in ("requested.yaml", "build-manifest.json", "backup.state", "monitor-v1-migrated", "manifest.new", "pending-client-ca.crt"):
+    for file in ("requested.yaml", "build-manifest.json", "backup.state", "monitor-v1-migrated", "manifest.new", "pending-client-ca.crt", "pending-server-tls"):
         removable.append(str(Path(p["INSTANCE_STATE"]) / file))
     # Validate every path before stopping the service or deleting anything.
     for item in removable:

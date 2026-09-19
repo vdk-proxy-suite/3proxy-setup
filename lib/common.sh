@@ -61,6 +61,7 @@ restore_latest_backup() {
     rm -f -- "$CONFIG_DIR/client-ca.crt"
   fi
   rm -f -- "$INSTANCE_STATE/pending-client-ca.crt"
+  rm -rf -- "$INSTANCE_STATE/pending-server-tls"
   rm -rf -- ${CONFIG_DIR}/tls
   if [[ -d "$BACKUP_DIR/tls" ]]; then
     install -d -m 755 ${CONFIG_DIR}

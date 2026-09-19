@@ -1,4 +1,4 @@
-# Standalone 3proxy setup 2.3.0
+# Standalone 3proxy setup 2.4.0
 
 Upstream: [3proxy/3proxy](https://github.com/3proxy/3proxy).
 
@@ -6,6 +6,11 @@ Upstream: [3proxy/3proxy](https://github.com/3proxy/3proxy).
 binary с обязательным OpenSSL client support, создаёт выбранные listeners и
 запускает health-check. Рассчитан на Ubuntu/Debian с `apt-get`, `systemd` и
 доступом в интернет.
+
+Версия 2.4.0 добавляет явный режим внешней серверной цепочки и ключа
+`tls.server.mode: external`. Цепочка, IP SAN, срок и соответствие ключа проверяются
+до остановки сервиса; runtime использует защищённую копию внутри instance.
+Управление выдачей/продлением ACME в этот релиз не входит.
 
 Версия 2.2.0 добавляет необязательный `listeners[].access`: без этого поля
 listener наследует весь глобальный access block, а при наличии локальный block
@@ -324,6 +329,58 @@ listeners. Порты listeners должны быть уникальны; loopba
 публичное UFW-правило. Установщик намеренно не зависит от приложения, которое
 будет использовать конкретный listener.
 
+## Внешний fullchain/key для HTTPS listeners (2.4.0)
+
+В `config.external-tls.example.yaml` показан режим:
+
+```yaml
+tls:
+  server:
+    mode: external
+    fullchain_file: /secure/https/fullchain.pem
+    private_key_file: /secure/https/privkey.pem
+```
+
+`fullchain_file` содержит leaf первым, затем необходимые intermediate CA.
+Leaf должен быть действующим серверным сертификатом с IP SAN, совпадающим с
+`server.public_ip`, и иметь не менее 24 часов запаса на момент setup.
+Проверяются цепочка доверия, serverAuth и соответствие приватному ключу.
+Зашифрованный ключ, неверный IP, просрочка, недостающий intermediate или
+неизвестный CA останавливают preflight до stop действующего сервиса.
+
+По умолчанию доверие берётся из системного
+`/etc/ssl/certs/ca-certificates.crt`. Для внешней частной PKI можно явно указать
+`tls.server.ca_file`; этот trust используется только для HTTPS-входа и не
+заменяет независимый `tls.client_ca_file` HTTPS-parent. Для публичной PKI
+устанавливать свой CA на клиент не требуется.
+
+Относительные пути разрешаются относительно YAML. Входные файлы и их предки
+должны принадлежать root и не быть доступны другим пользователям на запись;
+symlink/hardlink не принимаются. Приватный ключ не должен быть world-readable.
+Если ACME-клиент предоставляет symlink-пути, экспортируйте пару в защищённые
+обычные файлы перед передачей в этот режим.
+
+Preflight сохраняет проверенную пару в root-only state. Шаг конфигурации
+устанавливает её в `CONFIG_DIR/tls/server.crt` и `server.key`; ключ доступен
+только root и группе instance. Сохранённый `setup.yaml` ссылается на устойчивые
+копии, поэтому после удаления исходной папки работают update/reconfigure и
+rollback. Исходные файлы не удаляются cleanup. Backup/rollback включают полную
+предыдущую TLS-директорию, включая managed CA при переходе из старого режима.
+
+Для передачи следующего сертификата повторите reconfigure с исходным YAML и
+обновлёнными входными файлами. Сам по себе этот режим не наблюдает за ними и не
+запускает renewal. Изменение сертификата применяется обычным lifecycle setup
+с перезапуском выбранного instance.
+
+Старые YAML без `mode` продолжают использовать managed PKI. Переключение уже
+установленного external обратно на managed требует явного `mode: managed` и
+его параметров; пропуск mode не должен случайно заменить внешнюю цепочку CA VM.
+
+При external TLS E2E healthcheck по умолчанию использует системное доверие
+клиентской машины; `--proxy-ca-file` нужен только для внешнего частного CA.
+VM healthcheck использует настроенный server CA. Для managed режима прежнее
+требование передать публичный CA VM в E2E сохраняется.
+
 ## Managed TLS для HTTPS listeners
 
 При наличии хотя бы одного HTTPS listener обязателен `tls.server`:
@@ -465,7 +522,7 @@ venv/bin/python tools/healthcheck.py \
   --skip-upstreams
 ```
 
-`--proxy-ca-file` обязателен в E2E, если выбран хотя бы один HTTPS listener.
+`--proxy-ca-file` обязателен в E2E для HTTPS listener в managed режиме.
 Проверка доверяет этому CA, сверяет IP SAN с `server.public_ip`, требует TLS 1.2+
 и доказывает отказ принимать plaintext HTTP. `--skip-upstreams` отключает только
 отдельные прямые probes клиент → upstream; listener probes всё равно проходят
