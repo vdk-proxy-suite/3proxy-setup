@@ -1,3 +1,6 @@
+instance:
+  id: "main"
+
 install:
   version: "1.0.0"
   source_url: "https://github.com/3proxy/3proxy/archive/refs/tags/1.0.0.tar.gz"

@@ -4,18 +4,21 @@ source "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/common.sh"
 require_root
 parse_config_arg "$@"
 
-timestamp="$(date -u +%Y%m%dT%H%M%SZ)"
+timestamp="$(date -u +%Y%m%dT%H%M%S%NZ)"
 BACKUP_DIR="$BACKUP_ROOT/$timestamp"
 umask 077
 install -d -m 700 "$BACKUP_DIR"
 
-[[ -f /usr/local/bin/3proxy ]] && cp -a /usr/local/bin/3proxy "$BACKUP_DIR/3proxy"
-[[ -f /etc/3proxy/3proxy.cfg ]] && cp -a /etc/3proxy/3proxy.cfg "$BACKUP_DIR/3proxy.cfg"
-[[ -f /etc/3proxy/setup.yaml ]] && cp -a /etc/3proxy/setup.yaml "$BACKUP_DIR/setup.yaml"
-[[ -d /etc/3proxy/tls ]] && cp -a /etc/3proxy/tls "$BACKUP_DIR/tls"
-[[ -f /etc/systemd/system/3proxy.service ]] && cp -a /etc/systemd/system/3proxy.service "$BACKUP_DIR/3proxy.service"
-[[ -f /usr/local/share/3proxy-build/manifest.json ]] && cp -a /usr/local/share/3proxy-build/manifest.json "$BACKUP_DIR/build-manifest.json"
+[[ -f ${BINARY} ]] && cp -a ${BINARY} "$BACKUP_DIR/3proxy"
+[[ -f ${CONFIG_DIR}/3proxy.cfg ]] && cp -a ${CONFIG_DIR}/3proxy.cfg "$BACKUP_DIR/3proxy.cfg"
+[[ -f ${CONFIG_DIR}/setup.yaml ]] && cp -a ${CONFIG_DIR}/setup.yaml "$BACKUP_DIR/setup.yaml"
+[[ -f ${CONFIG_DIR}/client-ca.crt ]] && cp -a ${CONFIG_DIR}/client-ca.crt "$BACKUP_DIR/client-ca.crt"
+[[ -d ${CONFIG_DIR}/tls ]] && cp -a ${CONFIG_DIR}/tls "$BACKUP_DIR/tls"
+[[ -f ${UNIT_FILE} ]] && cp -a ${UNIT_FILE} "$BACKUP_DIR/3proxy.service"
+[[ -f ${BUILD_MANIFEST} ]] && cp -a ${BUILD_MANIFEST} "$BACKUP_DIR/build-manifest.json"
 install -m 600 "$CONFIG" "$BACKUP_DIR/requested-config.yaml"
+if systemctl is-active --quiet "$SERVICE"; then touch "$BACKUP_DIR/active"; fi
+if systemctl is-enabled --quiet "$SERVICE"; then touch "$BACKUP_DIR/enabled"; fi
 
 (
   cd "$BACKUP_DIR"
@@ -25,22 +28,10 @@ printf 'BACKUP_DIR=%s\n' "$BACKUP_DIR" > "$STATE_FILE"
 chmod 600 "$STATE_FILE"
 
 echo "==> Backup saved: $BACKUP_DIR"
-systemctl stop 3proxy 2>/dev/null || true
+systemctl stop "$SERVICE" 2>/dev/null || true
 
-for _ in {1..10}; do
-  pgrep -x 3proxy >/dev/null 2>&1 || break
-  sleep 1
-done
-if pgrep -x 3proxy >/dev/null 2>&1; then
-  pkill -TERM -x 3proxy || true
-  sleep 2
-fi
-if pgrep -x 3proxy >/dev/null 2>&1; then
-  pkill -KILL -x 3proxy || true
-fi
-
-if pgrep -x 3proxy >/dev/null 2>&1; then
-  echo "Unable to stop all 3proxy processes" >&2
+if systemctl is-active --quiet "$SERVICE"; then
+  echo "Unable to stop selected service: $SERVICE" >&2
   exit 1
 fi
-echo "==> 3proxy processes stopped"
+echo "==> Selected service stopped: $SERVICE"

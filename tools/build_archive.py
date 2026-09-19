@@ -11,7 +11,7 @@ import zipfile
 
 EXECUTABLE_NAMES = {"setup3proxy.sh", "clean3proxy.sh"}
 EXCLUDED_NAMES = {
-    "AGENTS.md", "__pycache__", ".git", ".agents", ".idea", ".vscode",
+    ".3proxy-instance.json", "AGENTS.md", "__pycache__", ".git", ".agents", ".idea", ".vscode",
     ".DS_Store", "Thumbs.db", "healthchecks", "venv", ".venv",
 }
 

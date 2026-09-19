@@ -11,6 +11,8 @@ from typing import Any
 
 import yaml
 
+from instance import identity, paths
+
 
 SUPPORTED_UPSTREAMS = {
     "socks_primary": "socks5",
@@ -36,6 +38,11 @@ def load_config(path: Path) -> dict[str, Any]:
         data = yaml.safe_load(stream)
     if not isinstance(data, dict):
         raise ValueError("YAML root must be a mapping")
+    tls = data.get("tls")
+    if isinstance(tls, dict) and isinstance(tls.get("client_ca_file"), str):
+        supplied = Path(tls["client_ca_file"])
+        if not supplied.is_absolute() and not tls["client_ca_file"].startswith("/") :
+            tls["client_ca_file"] = (path.resolve().parent / supplied).resolve().as_posix()
     return data
 
 
@@ -158,6 +165,8 @@ def upstream_credentials(upstream: dict[str, Any], name: str) -> tuple[str | Non
 
 
 def validate(data: dict[str, Any]) -> None:
+    if "instance" in data:
+        identity(data)
     install = data.get("install")
     if not isinstance(install, dict):
         raise ValueError("install must be a mapping")
@@ -187,7 +196,7 @@ def validate(data: dict[str, Any]) -> None:
         ca_file = client_ca_file(data)
         safe_token(ca_file, "tls.client_ca_file", colon=False)
         if (
-            not ca_file.startswith("/")
+            not (ca_file.startswith("/") or Path(ca_file).is_absolute())
             or ca_file == "/"
             or "//" in ca_file
             or posixpath.normpath(ca_file) != ca_file
@@ -380,6 +389,7 @@ def parent_line(data: dict[str, Any], name: str) -> str:
 
 
 def render_3proxy(data: dict[str, Any]) -> str:
+    instance_paths = paths(identity(data, legacy="instance" not in data))
     local_auth = data.get("local_auth", {})
     user = local_auth.get("username")
     password = local_auth.get("password")
@@ -395,7 +405,7 @@ def render_3proxy(data: dict[str, Any]) -> str:
         "nserver 8.8.8.8",
         "nserver 8.8.4.4",
         "nscache 65536",
-        "log /var/log/3proxy/3proxy.log D",
+        f"log {instance_paths['LOG_DIR']}/3proxy.log D",
         f"rotate {keep_files}",
         *(["archiver gz /usr/bin/gzip %F"] if logging.get("compress", True) else []),
         'logformat "-|+_Gv1|%t|%.|%D|%N|%p|%E|%U|%C|%c|%R|%r|%Q|%q|%n|%O|%I|%h|%T"',
@@ -407,8 +417,8 @@ def render_3proxy(data: dict[str, Any]) -> str:
     if has_https_listener(data):
         lines.extend([
             "# Managed TLS server settings for HTTPS listeners",
-            f"ssl_server_cert {MANAGED_TLS_SERVER_CERT_FILE}",
-            f"ssl_server_key {MANAGED_TLS_SERVER_KEY_FILE}",
+            f"ssl_server_cert {instance_paths['CONFIG_DIR']}/tls/server.crt",
+            f"ssl_server_key {instance_paths['CONFIG_DIR']}/tls/server.key",
             "ssl_server_min_proto_version TLSv1.2",
             "ssl_server_no_verify",
             "",
@@ -500,15 +510,20 @@ def render_openssl(data: dict[str, Any]) -> str:
     ])
 
 
-def render_systemd() -> str:
-    return """[Unit]
+def render_systemd(data: dict | None = None) -> str:
+    p = paths(identity(data, legacy="instance" not in data)) if data else paths(None)
+    service_settings = ""
+    if p["INSTANCE_ID"]:
+        service_settings = f"User={p['SERVICE_USER']}\nGroup={p['SERVICE_GROUP']}\nAmbientCapabilities=CAP_NET_BIND_SERVICE\nCapabilityBoundingSet=CAP_NET_BIND_SERVICE\nRuntimeDirectory={p['SERVICE']}\nRuntimeDirectoryMode=0750\n"
+    return f"""[Unit]
 Description=3proxy - modular installation
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/3proxy /etc/3proxy/3proxy.cfg
+{service_settings}ExecStart={p["BINARY"]} {p["CONFIG_DIR"]}/3proxy.cfg
+WorkingDirectory={p["DATA_DIR"]}
 Restart=always
 RestartSec=3
 LimitNOFILE=65536
@@ -540,6 +555,7 @@ def main() -> int:
             item.add_argument("--output", type=Path, required=True)
     systemd = sub.add_parser("render-systemd")
     systemd.add_argument("--output", type=Path, required=True)
+    systemd.add_argument("--config", type=Path)
     matches = sub.add_parser("manifest-matches")
     matches.add_argument("--manifest", type=Path, required=True)
     manifest = sub.add_parser("write-manifest")
@@ -565,7 +581,7 @@ def main() -> int:
     elif args.command == "render-openssl":
         write_text(args.output, render_openssl(data))
     elif args.command == "render-systemd":
-        write_text(args.output, render_systemd())
+        write_text(args.output, render_systemd(load_config(args.config) if args.config else None))
     elif args.command == "ports":
         for item in sorted(data["listeners"], key=lambda value: value["port"]):
             print(item["port"])

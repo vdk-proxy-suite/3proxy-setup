@@ -490,7 +490,8 @@ def add_listener_na(
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--config", type=Path, required=True)
+    parser.add_argument("--config", type=Path)
+    parser.add_argument("--instance")
     parser.add_argument("--scope", choices=("vm", "e2e"), default="e2e")
     parser.add_argument("--endpoint")
     parser.add_argument("--timeout", type=float)
@@ -498,7 +499,7 @@ def main() -> int:
     parser.add_argument(
         "--proxy-ca-file",
         type=Path,
-        help="CA certificate copied from /etc/3proxy/tls/ca.crt for HTTPS-listener E2E",
+        help="CA certificate copied from the selected instance tls/ca.crt for HTTPS-listener E2E",
     )
     parser.add_argument(
         "--tls-gate-only",
@@ -511,7 +512,14 @@ def main() -> int:
         help="probe configured listeners without contacting parent endpoints directly",
     )
     args = parser.parse_args()
+    from instance import paths, identity
+    if args.config is None:
+        if args.instance is None:
+            parser.error("--config or --instance is required")
+        args.config = Path(paths(args.instance)["CONFIG_DIR"]) / "setup.yaml"
     config = load_config(args.config)
+    if args.instance and identity(config) != args.instance:
+        parser.error("--instance does not match configuration")
     timeout = args.timeout or float(config["probes"]["timeout_seconds"])
     public_ip = config["server"]["public_ip"]
     default_listen_ip = config["server"]["listen_ip"]
@@ -535,13 +543,13 @@ def main() -> int:
     if args.scope == "e2e" and selected_https_listeners and args.proxy_ca_file is None:
         parser.error(
             "--proxy-ca-file is required for HTTPS-listener E2E; copy the VM's "
-            "/etc/3proxy/tls/ca.crt without copying its private key"
+            "the selected instance tls/ca.crt without copying its private key"
         )
     if args.proxy_ca_file is not None and not args.proxy_ca_file.is_file():
         parser.error(f"proxy CA file not found: {args.proxy_ca_file}")
     if args.tls_gate_only and not selected_https_listeners:
         parser.error("--tls-gate-only requires a selected HTTPS listener")
-    proxy_ca_file = str(args.proxy_ca_file) if args.proxy_ca_file is not None else MANAGED_TLS_CA_FILE
+    proxy_ca_file = str(args.proxy_ca_file) if args.proxy_ca_file is not None else (f"/etc/3proxy-setup/instances/{config['instance']['id']}/tls/ca.crt" if "instance" in config else MANAGED_TLS_CA_FILE)
 
     for listener in config["listeners"]:
         endpoint = listener["id"]

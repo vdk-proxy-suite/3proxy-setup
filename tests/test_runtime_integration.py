@@ -69,10 +69,20 @@ def _unused_loopback_port() -> int:
 
 
 class _SentinelTarget:
-    def __init__(self) -> None:
+    def __init__(self, port_last_digit: int | None = None) -> None:
         self._listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self._listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self._listener.bind(("127.0.0.1", 0))
+        if port_last_digit is None:
+            self._listener.bind(("127.0.0.1", 0))
+        else:
+            for candidate in range(24000 + port_last_digit, 65000, 10):
+                try:
+                    self._listener.bind(("127.0.0.1", candidate))
+                    break
+                except OSError:
+                    continue
+            else:
+                raise RuntimeError("no free sentinel port with the requested final digit")
         self._listener.listen()
         self._listener.settimeout(0.1)
         self.port = int(self._listener.getsockname()[1])
@@ -169,6 +179,7 @@ class _TlsConnectParent:
         self.sni_names: list[str | None] = []
         self.requests: list[bytes] = []
         self.authorization_values: list[str] = []
+        self.auth_rejections = 0
         self.connect_targets: list[tuple[str, int]] = []
         self.tls_sessions = 0
         self.tls_errors: list[str] = []
@@ -261,6 +272,8 @@ class _TlsConnectParent:
                         b'Proxy-Authenticate: Basic realm="runtime-test"\r\n'
                         b"Content-Length: 0\r\nConnection: close\r\n\r\n"
                     )
+                    with self._lock:
+                        self.auth_rejections += 1
                 except (ssl.SSLEOFError, BrokenPipeError, ConnectionResetError):
                     # 3proxy may close as soon as it consumes this deliberate rejection.
                     # Keep all errors outside this one expected peer-close path observable.
@@ -1396,7 +1409,10 @@ class GeneratedHttpsBridgeRuntimeTests(unittest.TestCase):
         listener_port = _unused_loopback_port()
         payload = b"must-not-pass-upstream-auth"
         wrong_dummy_password = "WrongRuntimeParentDummy_41"
-        with _SentinelTarget() as sentinel, _TlsConnectParent(
+        # Pinned 1.0.0 can report a misleading frontend 200 when the target ends in 2.
+        # Exercise that known response-parser quirk deterministically, and prove that
+        # parent authorization and application transport remain closed independently.
+        with _SentinelTarget(port_last_digit=2) as sentinel, _TlsConnectParent(
             self.server_certificate,
             self.server_key,
             ("127.0.0.1", sentinel.port),
@@ -1415,9 +1431,10 @@ class GeneratedHttpsBridgeRuntimeTests(unittest.TestCase):
                     payload,
                 )
                 self.assertTrue(parent.wait_for_attempt(), "upstream-auth CONNECT attempt was not observed")
-                self.assertFalse(
-                    result.status is not None and 200 <= result.status < 300,
-                    f"wrong upstream password was accepted: {result.header!r}\n{running.diagnostics()}",
+                self.assertGreaterEqual(parent.auth_rejections, 1, "parent did not emit the required 407")
+                self.assertEqual(
+                    result.tunneled, b"",
+                    f"wrong upstream credentials transferred application data: {result.header!r}\n{running.diagnostics()}",
                 )
 
             self._assert_tls_only(parent)
@@ -1433,6 +1450,7 @@ class GeneratedHttpsBridgeRuntimeTests(unittest.TestCase):
             )
             self.assertEqual(parent.connect_targets, [])
             self.assertEqual(sentinel.hit_count, 0, "parent auth failure fell back to a direct target connection")
+            self.assertEqual(sentinel.payloads, [], "wrong-auth traffic reached the application")
             self.assertFalse(parent.errors, parent.errors)
 
 

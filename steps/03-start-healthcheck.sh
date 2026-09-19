@@ -5,15 +5,15 @@ require_root
 parse_config_arg "$@"
 
 systemctl daemon-reload
-systemctl enable 3proxy >/dev/null
-systemctl restart 3proxy
+systemctl enable "$SERVICE" >/dev/null
+systemctl restart "$SERVICE"
 
 for _ in {1..10}; do
-  systemctl is-active --quiet 3proxy && break
+  systemctl is-active --quiet "$SERVICE" && break
   sleep 1
 done
-if ! systemctl is-active --quiet 3proxy; then
-  systemctl status 3proxy --no-pager -l >&2 || true
+if ! systemctl is-active --quiet "$SERVICE"; then
+  systemctl status "$SERVICE" --no-pager -l >&2 || true
   exit 1
 fi
 
@@ -28,14 +28,14 @@ if [[ "$https_listener_state" == "true" ]]; then
   done <<< "$https_listener_ids"
 fi
 
-install -d -m 755 /var/log/3proxy/healthchecks
+install -d -m 755 ${LOG_DIR}/healthchecks
 stamp="$(date -u +%Y%m%dT%H%M%SZ)"
-report="/var/log/3proxy/healthchecks/$stamp.json"
+report="${LOG_DIR}/healthchecks/$stamp.json"
 set +e
 python3 "$SETUP_ROOT/tools/healthcheck.py" --config "$CONFIG" --scope vm --json "$report"
 health_rc=$?
 set -e
-cp -f "$report" /var/log/3proxy/healthchecks/latest.json
+cp -f "$report" ${LOG_DIR}/healthchecks/latest.json
 if [[ $health_rc -ne 0 ]]; then
   echo "==> Health-check reports degraded endpoints (non-blocking): $report"
 else

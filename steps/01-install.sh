@@ -11,9 +11,9 @@ patch_sha="$(python3 "$SETUP_ROOT/tools/build_checks.py" patchset-sha \
   --directory "$SETUP_ROOT/patches")"
 build_profile="cmake-openssl"
 
-if [[ "${FORCE_REBUILD:-0}" != "1" && -x /usr/local/bin/3proxy && -f /usr/local/share/3proxy-build/manifest.json ]]; then
+if [[ "${FORCE_REBUILD:-0}" != "1" && -x ${BINARY} && -f ${BUILD_MANIFEST} ]]; then
   if python3 "$SETUP_ROOT/tools/config.py" manifest-matches \
-      --manifest /usr/local/share/3proxy-build/manifest.json \
+      --manifest ${BUILD_MANIFEST} \
       --version "$version" --source-sha "$source_sha" --patch-sha "$patch_sha" \
       --build-profile "$build_profile"; then
     echo "==> Installed binary matches source and patch manifest; build skipped"
@@ -21,11 +21,9 @@ if [[ "${FORCE_REBUILD:-0}" != "1" && -x /usr/local/bin/3proxy && -f /usr/local/
   fi
 fi
 
-export DEBIAN_FRONTEND=noninteractive
-apt-get update
-apt-get install -y --no-install-recommends build-essential cmake curl ca-certificates libssl-dev openssl patch python3-yaml iproute2
+python3 "$SETUP_ROOT/tools/instance.py" dependencies "$@"
 
-work="$(mktemp -d /tmp/3proxy-build.XXXXXX)"
+work="$(mktemp -d "$INSTANCE_STATE/build.XXXXXX")"
 feature_pid=""
 feature_parent_pid=""
 feature_parent_rc=1
@@ -188,14 +186,14 @@ fi
 kill "$feature_pid" 2>/dev/null || true
 wait "$feature_pid" 2>/dev/null || true
 feature_pid=""
-install -D -m 755 "$binary" /usr/local/bin/3proxy.new
-mv -f /usr/local/bin/3proxy.new /usr/local/bin/3proxy
+install -D -m 755 "$binary" ${BINARY}.new
+mv -f ${BINARY}.new ${BINARY}
 
-install -d -m 755 /usr/local/share/3proxy-build
-binary_sha="$(sha256sum /usr/local/bin/3proxy | awk '{print $1}')"
+install -d -m 755 $(dirname "$BUILD_MANIFEST")
+binary_sha="$(sha256sum ${BINARY} | awk '{print $1}')"
 python3 "$SETUP_ROOT/tools/config.py" write-manifest \
-  --output /usr/local/share/3proxy-build/manifest.json \
+  --output ${BUILD_MANIFEST} \
   --version "$version" --source-sha "$source_sha" --patch-sha "$patch_sha" \
   --build-profile "$build_profile" --binary-sha "$binary_sha"
-chmod 644 /usr/local/share/3proxy-build/manifest.json
+chmod 644 ${BUILD_MANIFEST}
 echo "==> Installed 3proxy $version with verified OpenSSL server/client support ($binary_sha)"

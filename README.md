@@ -1,4 +1,4 @@
-# Standalone 3proxy setup 2.2.1
+# Standalone 3proxy setup 2.3.0
 
 Upstream: [3proxy/3proxy](https://github.com/3proxy/3proxy).
 
@@ -27,7 +27,7 @@ listener наследует весь глобальный access block, а пр�
 клиент → 3proxy начинается с проверяемого TLS, а внутри него работает обычный
 HTTP proxy с GET и CONNECT. Установщик создаёт для каждой VM приватный CA и
 серверный сертификат с обязательным IP SAN, хранит ключи только под
-`/etc/3proxy/tls` и переиспользует действующий trust anchor при перевыпуске leaf.
+`/etc/3proxy-setup/instances/main/tls` и переиспользует действующий trust anchor при перевыпуске leaf.
 HTTPS listener можно независимо сочетать с direct, SOCKS5, HTTP и HTTPS
 маршрутами. Поэтому доступны полные 3 direct + 9 two-hop комбинаций.
 
@@ -61,6 +61,94 @@ sha256:  35b07de1046f3aaeac4a7085101b7e5c453efa3527cbdc42a84690366c7ecfa8
 parent. На входе проверяются CA и IP SAN, на выходе — CA и ожидаемый DNS SNI;
 parent дополнительно валидирует сам CONNECT request.
 
+## Изолированные экземпляры (2.3.0)
+
+Каждая распакованная папка принадлежит одному `instance.id`. В YAML обязательно
+задайте уникальный ID по шаблону `[a-z][a-z0-9-]{0,19}`; примеры содержат `main`.
+Перед установкой второго экземпляра измените и ID, и занятые первым порты.
+Имя папки не определяет ID. Параллельные setup не поддерживаются.
+
+```yaml
+instance:
+  id: "main"
+```
+
+Установщик сохраняет root-owned manifest до создания ресурсов и проверяет
+владельца, symlink/hardlink, UID/GID, хеш unit и конфликт портов перед изменениями.
+Имена unit/user/group выводятся из ID; произвольные переопределения путей и имён
+не поддерживаются. Неизвестный ID нельзя остановить или удалить. При повторном
+развёртывании того же ID из другой папки требуется `--update-existing`; это
+явное обновление уже установленного экземпляра. Скопированная папка с прежним
+ID не создаёт второй экземпляр.
+
+| Ресурс | Путь для `main` |
+|---|---|
+| Unit / user / group | `3proxy-main.service` / `3proxy-main` / `3proxy-main` |
+| Конфиги и private CA | `/etc/3proxy-setup/instances/main/` |
+| Binary | `/opt/3proxy/instances/main/bin/3proxy` |
+| Данные | `/var/lib/3proxy-instances/main/` |
+| Логи и healthchecks | `/var/log/3proxy-setup/instances/main/` |
+| Runtime | `/run/3proxy-main/` |
+| Manifest, сборка и backups | `/var/lib/3proxy-setup/instances/main/` |
+| Установленные управляющие скрипты | `/usr/local/lib/3proxy-setup/instances/main/` |
+
+Сервис работает от отдельного системного пользователя с правом bind низких
+портов. Config и server key доступны его группе; private CA key остаётся
+root-only. `proxy-observability` сохраняет доступ к файлам журналов. Выбранный
+экземпляр имеет собственный binary: обновление A не заменяет executable B.
+После переноса или удаления распакованной папки сервис и управление через
+установленные скрипты продолжают работать:
+
+```bash
+sudo ./setup3proxy.sh all --config ./config.yaml
+sudo ./setup3proxy.sh update --instance main
+sudo ./setup3proxy.sh reconfigure --config ./config.yaml
+sudo ./setup3proxy.sh stop --instance main
+sudo ./setup3proxy.sh start --instance main
+sudo ./setup3proxy.sh status --instance main
+sudo ./setup3proxy.sh healthcheck --instance main
+sudo ./setup3proxy.sh backup --instance main
+sudo ./setup3proxy.sh rollback --instance main
+sudo /usr/local/lib/3proxy-setup/instances/main/setup3proxy.sh status --instance main
+```
+
+`--instance ID` использует установленный `setup.yaml`, а до окончания установки
+— защищённый snapshot в state. При одновременных `--config` и `--instance` ID
+должны совпадать. Те же аргументы принимают отдельные `steps/00..03`;
+`tools/healthcheck.py` принимает `--config` или `--instance`. Backup, как и шаг 0,
+останавливает только выбранный unit; возобновить его можно через `start`.
+Rollback восстанавливает конфиг, binary, PKI и прежнее enabled/active состояние.
+Шаги и rollback не используют глобальный поиск/убийство процессов по имени.
+
+Относительный `tls.client_ca_file` разрешается относительно YAML, независимо
+от текущего каталога. Пользовательский public CA копируется в `client-ca.crt`
+в каталоге instance; runtime и сохранённый YAML используют этот устойчивый путь.
+Новый CA сначала сохраняется в state и применяется после backup; rollback
+восстанавливает прежний CA. Исходная папка для работы TLS-parent не требуется.
+
+Setup не обновляет уже установленные общие пакеты. Запрашиваются только отсутствующие
+зависимости; если solver требует обновления или удаления уже установленных
+пакетов, установка останавливается: зависимости нужно обновить отдельно.
+Для чтения YAML заранее нужны `python3` и `python3-yaml`. Общие ОС, сеть,
+пакеты и journal остаются общими; namespace ресурсов не является контейнером.
+
+### Существующая установка без ID
+
+Старый YAML не переводится в новый namespace автоматически. Для осознанного
+обслуживания прежнего `3proxy.service` добавьте `--legacy` к `all`, `reconfigure`
+или отдельному шагу. Первое принятие существующего unit допускает только точный
+unit предыдущего релиза, без сторонних drop-ins; установщик сохраняет manifest.
+Legacy cleanup после такого принятия удаляет только известные legacy-файлы,
+не каталоги `instances/`, не чужие процессы и не общие журналы.
+
+Для перехода с legacy на named instance: сохраните legacy backup и CA, создайте
+профиль с новым ID и свободными портами, установите и проверьте новый экземпляр,
+переключите клиентов, затем явно остановите/очистите legacy через `--legacy`.
+При необходимости сохранить прежний trust anchor скопируйте CA/leaf из backup
+в новый root-owned `.../instances/ID/tls` после шага 1 и до шага 2; ключи должны
+остаться защищёнными. Автоматический перенос/удаление старого экземпляра и
+неявное присвоение его identity не выполняются.
+
 ## Быстрый запуск
 
 После распаковки на VM:
@@ -68,7 +156,7 @@ parent дополнительно валидирует сам CONNECT request.
 ```bash
 cd 3proxy-setup
 cp config.example.yaml config.yaml
-nano config.yaml
+nano config.yaml  # задайте instance.id и свободные порты
 sudo ./setup3proxy.sh all
 ```
 
@@ -109,6 +197,8 @@ renders: listeners без собственного `access` продолжают
 
 В `config.yaml` замените:
 
+- `instance.id` на уникальный ID установки
+
 - `server.public_ip` на публичный IPv4 VM
 - `local_auth` на локальные credentials прокси, если хотя бы один listener
   фактически использует `strong`
@@ -138,7 +228,7 @@ TLS на входе и TLS до parent независимы. Для HTTPS listen
 
 ```bash
 cp config.https.example.yaml config.yaml
-nano config.yaml
+nano config.yaml  # задайте instance.id и свободные порты
 sudo ./setup3proxy.sh all
 ```
 
@@ -214,6 +304,17 @@ parent 1000 connect+s ...
 работает только по whitelist и не требует Basic auth, удалите одновременно
 `username` и `password`; указывать только одно из двух запрещено.
 
+У закреплённого upstream 3proxy 1.0.0 есть особенность обработки повторного
+CONNECT: после отклонения credentials HTTPS-parent с `407` frontend иногда
+возвращает клиенту вводящий в заблуждение `200 Connection established`, после
+чего туннель закрывается без передачи данных. Это воспроизводится и до 2.3.0;
+данный релиз не исправляет upstream parser и не меняет pin/patchset. Проверка
+неверного пароля теперь детерминированно воспроизводит этот случай и требует
+фактический parent `407`, отсутствие успешной авторизации, ноль переданных
+байтов и ноль соединений с target (включая обходной direct). Сам по себе
+frontend status не считается доказательством успешной авторизации или маршрута.
+Проверки TLS-first, CA/SNI и остальных отказов сохраняются.
+
 Поле `id` — непрозрачная метка listener, а не имя предопределённой topology.
 Допустимы уникальные строки длиной до 64 символов по шаблону
 `^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$`. Маршрут задаётся исключительно полями
@@ -241,13 +342,14 @@ tls:
 3650 дней и должен быть больше срока leaf. `tls.server` допустим только при
 HTTPS listener; независимый `tls.client_ca_file` — только при HTTPS upstream.
 
-PKI хранится в root-only каталоге `/etc/3proxy/tls`:
+PKI хранится в защищённом каталоге `/etc/3proxy-setup/instances/main/tls`:
 
 - `ca.crt` — публичный trust anchor, который передаётся клиентам
 - `ca.key` — приватный ключ CA, который нельзя копировать с VM
 - `server.crt` и `server.key` — leaf certificate и его приватный ключ
 
-Каталог имеет mode `700`, приватные ключи — `600`. При
+В named instance каталог имеет mode `750` и группу instance; `server.key` —
+`640 root:instance`, а `ca.key` — `600 root:root`. В legacy режиме ключи доступны root. При
 `regenerate_on_setup: false` валидный CA сохраняется. Leaf переиспользуется,
 пока цепочка, ключ, IP SAN, точный набор DNS SAN и срок действия соответствуют
 конфигурации. Смена публичного IP или DNS SAN перевыпускает только leaf под тем
@@ -347,7 +449,7 @@ sudo ./setup3proxy.sh all --config /secure/path/proxy.yaml
 канал. Приватные `ca.key` и `server.key` должны остаться на VM:
 
 ```bash
-ssh VM_ALIAS 'sudo cat /etc/3proxy/tls/ca.crt' > ./VM_ALIAS-3proxy-ca.crt
+ssh VM_ALIAS 'sudo cat /etc/3proxy-setup/instances/main/tls/ca.crt' > ./VM_ALIAS-3proxy-ca.crt
 openssl x509 -in ./VM_ALIAS-3proxy-ca.crt -noout -fingerprint -sha256
 ```
 
@@ -394,31 +496,55 @@ Gate проверяет цепочку, IP SAN, TLS 1.2+ и отказ plaintext
 сама VM не входит в allowlist. Для `iponly` доступ, ACL и GET/CONNECT следует
 доказать E2E с разрешённого внешнего IP; gate не расширяет ACL.
 
-## Полная очистка
+## Очистка одного экземпляра
 
-Без `--yes` cleaner работает как dry-run и только показывает план:
-
-```bash
-./clean3proxy.sh
-sudo ./clean3proxy.sh --yes
-```
-
-Очистка останавливает service и процессы, удаляет binary, systemd unit, конфиги,
-логи, runtime state, build manifest и rollback-backup. Распакованный каталог
-сохраняется для повторной установки. Дополнительные режимы:
+Без `--yes` cleaner показывает dry-run. Выбор обязателен через YAML или ID:
 
 ```bash
-sudo ./clean3proxy.sh --yes --keep-backups
-sudo ./clean3proxy.sh --yes --purge-setup
-sudo ./clean3proxy.sh --yes --purge-ufw
+sudo ./clean3proxy.sh --instance main
+sudo ./clean3proxy.sh --instance main --yes
+sudo ./clean3proxy.sh --instance main --yes --purge-logs
+sudo ./clean3proxy.sh --instance main --yes --keep-backups
+sudo ./clean3proxy.sh --instance main --yes --purge-setup
+sudo ./setup3proxy.sh cleanup --instance main --yes
 ```
 
-`--purge-ufw` включается только явно. Он удаляет лишь правила для non-loopback
-listeners и dynamic UDP relay, если такой внешний UDP listener был настроен.
-Cleaner не меняет cloud security groups и не очищает глобальный systemd journal.
+Обычная очистка удаляет unit, отдельный user/group, binary, конфиги/PKI, данные,
+runtime и backups только выбранного экземпляра. Логи сохраняются; их удаляет
+лишь `--purge-logs`. `--keep-backups` сохраняет root-only backup с приватным CA.
+`--purge-setup` удаляет только отмеченную ownership token распакованную папку.
+Если в ней остались `.log`, `.gz` или healthcheck reports, без `--purge-logs`
+папка сохраняется целиком. Оставшиеся после прерывания сборки файлы удаляются,
+а её `.log` сохраняются в `LOG_DIR/setup-build/`, если не указан `--purge-logs`.
+Сохранённые журналы получают владельца root перед удалением service user,
+чтобы повторное использование UID не открыло их другому экземпляру.
+Проверка несовпадающего UID/GID, unit hash, symlink или чужого потребителя
+останавливает опасную операцию до удаления.
 
-Обычный `clean3proxy.sh --yes` удаляет `/etc/3proxy` вместе с managed CA,
-приватным ключом и leaf. Без `--keep-backups` удаляется и root-only backup со
-старой PKI. После чистой переустановки клиенты не подключатся, пока не получат
-новый `ca.crt`. `--keep-backups` сохраняет возможность восстановить прежний CA,
-но backup содержит приватный `ca.key` и должен оставаться доступным только root.
+Manifest и root-owned управляющие скрипты остаются для повторного cleanup
+после частичной установки, удаления YAML или исходной папки:
+
+```bash
+sudo /usr/local/lib/3proxy-setup/instances/main/clean3proxy.sh \
+  --instance main --yes --purge-logs
+```
+
+При `manage_ufw: true` новые правила получают comment с ID и ownership token;
+manifest сохраняет их до изменения firewall. Совпадающие ранее существовавшие
+правила не присваиваются экземпляру и не получают новый comment. Loopback
+listeners по-прежнему не создают публичных правил.
+
+`--purge-ufw` или `--purge-shared-components` явно разрешают удаление только
+созданных этим экземпляром UFW-правил с неизменённым ownership comment,
+без зависимости зарегистрированных соседей и без другого активного TCP listener.
+При неопределённом владельце или потребителе правило сохраняется с объяснением;
+пересекающиеся dynamic UDP ranges соседей также сохраняются. Без этих флагов
+firewall не очищается. Общие пакеты и `proxy-observability` сохраняются даже с
+`--purge-shared-components`: исключительное владение ими не доказано.
+Глобальный systemd journal и cloud security groups никогда не очищаются.
+Собственные file logs и встроенная daily rotation находятся в каталоге instance;
+общая logrotate-конфигурация не создаётся.
+
+После удаления CA и чистой переустановки клиентам потребуется новый `ca.crt`.
+Default cleanup не удаляет журналы, но удаляет секреты установленного YAML;
+сохранённые по явному флагу backups и исходная папка требуют отдельного хранения.
