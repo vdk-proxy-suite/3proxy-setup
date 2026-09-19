@@ -1,4 +1,4 @@
-# Standalone 3proxy setup 2.5.0
+# Standalone 3proxy setup 2.5.1
 
 Upstream: [3proxy/3proxy](https://github.com/3proxy/3proxy).
 
@@ -6,6 +6,10 @@ Upstream: [3proxy/3proxy](https://github.com/3proxy/3proxy).
 binary с обязательным OpenSSL client support, создаёт выбранные listeners и
 запускает health-check. Рассчитан на Ubuntu/Debian с `apt-get`, `systemd` и
 доступом в интернет.
+
+Версия 2.5.1 исправляет гонку с reconfigure: ACME job читает актуальный YAML
+после получения instance lock и повторно проверяет identity. Ожидавшая задача
+не выполняет renewal/deploy по устаревшей политике после отключения автоматики.
 
 Версия 2.5.0 добавляет YAML ACME IP: отдельное фоновое renewal и применение
 нового сертификата с restart instance только в 05:00 Europe/Moscow.

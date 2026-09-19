@@ -267,4 +267,46 @@ class AcmeOwnershipTests(unittest.TestCase):
         self.assertTrue(self.r["registry"].exists())
 
 
+
+class AcmeQueuedPolicyTests(unittest.TestCase):
+    def invoke_queued(self, change):
+        import contextlib
+        import io
+        with tempfile.TemporaryDirectory() as name:
+            root=Path(name);p=instance.paths("main")
+            p["CONFIG_DIR"]=str(root)
+            file=root/"setup.yaml";value=data()
+            file.write_text(yaml.safe_dump(value))
+            @contextlib.contextmanager
+            def waited(*args,**kwargs):
+                updated=copy.deepcopy(value);change(updated)
+                file.write_text(yaml.safe_dump(updated))
+                yield 1
+            with mock.patch.object(sys,"argv",["acme.py","renew","--instance","main"]), \
+                 mock.patch.object(instance,"paths",return_value=p), \
+                 mock.patch.object(instance,"read_manifest",return_value={"status":"installed"}), \
+                 mock.patch.object(instance,"checked_accounts"),mock.patch.object(instance,"verify_unit"), \
+                 mock.patch.object(acme.os,"geteuid",return_value=0,create=True), \
+                 mock.patch.object(acme.operation_lock,"acquire",side_effect=waited), \
+                 mock.patch.object(acme,"issuance") as issuance, \
+                 mock.patch.object(acme,"run",return_value=subprocess.CompletedProcess([],3,"","")), \
+                 contextlib.redirect_stdout(io.StringIO()):
+                result=acme.main()
+                issuance.assert_not_called()
+                return result
+
+    def test_queued_job_rereads_disabled_policy_after_lock(self):
+        self.assertEqual(self.invoke_queued(lambda value:value["tls"]["server"]["acme"].update(
+            renewal={"enabled":False})),0)
+
+    def test_queued_job_rereads_removed_acme_mode_after_lock(self):
+        def change(value):
+            value["tls"]["server"]={"dns_names":[],"validity_days":365,"ca_validity_days":3650,"regenerate_on_setup":False}
+        self.assertEqual(self.invoke_queued(change),0)
+
+    def test_queued_job_rejects_changed_instance_identity_after_lock(self):
+        with self.assertRaisesRegex(ValueError,"identity"):
+            self.invoke_queued(lambda value:value["instance"].update(id="another"))
+
+
 if __name__=="__main__":unittest.main()

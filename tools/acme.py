@@ -553,10 +553,13 @@ def main() -> int:
         data = config_tool.load_config(args.config);config_tool.validate(data)
         p = instance.paths(data.get("instance", {}).get("id"));path=args.config
     else: parser.error("--config or --instance required")
-    data = config_tool.load_config(path);config_tool.validate(data)
-    if not policy.enabled(data) and args.action not in ("configure", "backup", "rollback"): return 0
     if os.geteuid() != 0: raise ValueError("ACME controller requires root")
     with operation_lock.acquire(p["INSTANCE_ID"]):
+        # Lifecycle may have changed YAML while this job waited for the lock.
+        data = config_tool.load_config(path);config_tool.validate(data)
+        if (data.get("instance", {}).get("id") or "") != p["INSTANCE_ID"]:
+            raise ValueError("configuration identity changed while waiting for instance lock")
+        if not policy.enabled(data) and args.action not in ("configure", "backup", "rollback"): return 0
         manifest = instance.read_manifest(p)
         if not manifest or manifest.get("status") == "removed": raise ValueError("no active instance ownership")
         instance.checked_accounts(p, manifest);instance.verify_unit(p, manifest)
