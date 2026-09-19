@@ -1,4 +1,6 @@
-# Standalone 3proxy setup 2.2.0
+# Standalone 3proxy setup 2.2.1
+
+Upstream: [3proxy/3proxy](https://github.com/3proxy/3proxy).
 
 Пакет устанавливает 3proxy 1.0.0 из проверенного tag-архива, собирает основной
 binary с обязательным OpenSSL client support, создаёт выбранные listeners и
