@@ -24,7 +24,7 @@ import tls_material as tls
 
 def data():
     value=config.load_config(ROOT/"config.https.example.yaml")
-    value["tls"]["server"]={"mode":"acme_ip","acme":{"agree_tos":True}}
+    value["tls"]["server"]={"mode":"acme_ip","acme":{"agree_tos":True,"preferred_chain":"external-test-root"}}
     return value
 
 
@@ -66,6 +66,7 @@ class AcmeSchemaTests(unittest.TestCase):
         renewal=acme.certbot_args(p,value,first=False)
         self.assertIn("--ip-address",first);self.assertIn("--keep-until-expiring",first)
         self.assertIn("--required-profile",first);self.assertIn("shortlived",first)
+        self.assertEqual(first[first.index("--preferred-chain")+1], "external-test-root")
         self.assertIn("--no-reuse-key",renewal);self.assertIn("renew",renewal)
         self.assertNotIn("--force-renewal",renewal)
         self.assertNotIn("--no-verify-ssl",first)

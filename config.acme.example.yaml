@@ -30,6 +30,7 @@ tls:
       email: admin@example.com
       profile: shortlived
       challenge: http-01
+      preferred_chain: ISRG Root X2
       renewal:
         enabled: true
         interval_minutes: 60

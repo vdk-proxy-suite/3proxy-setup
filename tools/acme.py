@@ -177,6 +177,21 @@ def leaf_info(certificate: Path) -> dict:
                 ips=sorted(value for kind, value in decoded.get("subjectAltName", ()) if kind == "IP Address"))
 
 
+def chain_root(certificate: Path) -> str:
+    """Return the issuer CN of the top certificate in the served chain."""
+    certs = tls.CERTIFICATE.findall(certificate.read_bytes())
+    if not certs:
+        raise ValueError("ACME returned an empty certificate chain")
+    with tempfile.TemporaryDirectory(prefix="3proxy-acme-chain-") as temporary:
+        top = Path(temporary) / "top.crt"
+        top.write_bytes(certs[-1])
+        decoded = ssl._ssl._test_decode_cert(str(top))
+    issuer = dict(item for rdn in decoded.get("issuer", ()) for item in rdn)
+    value = issuer.get("commonName")
+    if not value:
+        raise ValueError("ACME top certificate has no issuer commonName")
+    return value
+
 def read_bundle(directory: Path) -> dict:
     return {name: tls.read_input(directory/name, private=name.endswith(".key"))
             for name in ("server.crt", "server.key", "trust.crt") if (directory/name).exists()}
@@ -189,6 +204,13 @@ def validate(data: dict, bundle: dict, minimum=86400) -> None:
     if policy.settings(data)["environment"] == "staging":
         supplied["trust.crt"] = trust_file(data).read_bytes()
     tls.validate_bundle(supplied, str(data["server"]["public_ip"]), minimum_seconds=minimum)
+    expected_chain = policy.settings(data)["preferred_chain"]
+    with tempfile.TemporaryDirectory(prefix="3proxy-acme-bundle-") as temporary:
+        served = Path(temporary) / "server.crt"
+        served.write_bytes(bundle["server.crt"])
+        actual_chain = chain_root(served)
+    if actual_chain != expected_chain:
+        raise ValueError(f"ACME selected chain {actual_chain!r}, expected {expected_chain!r}")
     with tempfile.TemporaryDirectory(prefix="3proxy-acme-leaf-") as temporary:
         leaf = Path(temporary)/"leaf.crt"
         leaf.write_bytes(bundle["server.crt"])
@@ -208,6 +230,7 @@ def certbot_args(p: dict, data: dict, *, first: bool) -> list[str]:
             "--logs-dir", str(directory/"logs"), "--server", policy.DIRECTORIES[settings["environment"]],
             "--cert-name", lineage, "--standalone", "--preferred-challenges", "http-01",
             "--required-profile", "shortlived", "--no-reuse-key", "--no-directory-hooks"]
+    args += ["--preferred-chain", settings["preferred_chain"]]
     if first:
         args += ["--ip-address", str(data["server"]["public_ip"]), "--keep-until-expiring"]
         args += ["--email", settings["email"]] if settings["email"] else ["--register-unsafely-without-email"]
@@ -260,7 +283,9 @@ def active_matches(p: dict, data: dict) -> bool:
     directory = Path(p["CONFIG_DIR"])/"tls"
     try:
         marker = (directory/"mode").read_text().strip()
-        return marker == "acme:"+policy.settings(data)["environment"] and leaf_info(directory/"server.crt")["ips"] == [str(data["server"]["public_ip"])]
+        return (marker == "acme:"+policy.settings(data)["environment"]
+                and leaf_info(directory/"server.crt")["ips"] == [str(data["server"]["public_ip"])]
+                and chain_root(directory/"server.crt") == policy.settings(data)["preferred_chain"])
     except (OSError, ValueError, ssl.SSLError):
         return False
 

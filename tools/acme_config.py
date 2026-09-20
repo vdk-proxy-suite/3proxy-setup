@@ -17,6 +17,7 @@ def enabled(data: dict) -> bool:
 def settings(data: dict) -> dict:
     value = data["tls"]["server"]["acme"]
     return dict(environment=value.get("environment", "production"), email=value.get("email"),
+                preferred_chain=value.get("preferred_chain", "ISRG Root X2"),
                 renewal_enabled=value.get("renewal", {}).get("enabled", True),
                 interval_minutes=value.get("renewal", {}).get("interval_minutes", 60),
                 retain_state=value.get("cleanup", {}).get("retain_state", False))
@@ -26,7 +27,7 @@ def validate(server: dict) -> None:
     if set(server) != {"mode", "acme"}:
         raise ValueError("acme_ip tls.server must contain only mode and acme")
     value = server["acme"]
-    if not isinstance(value, dict) or set(value) - {"environment", "email", "agree_tos", "profile", "challenge", "renewal", "deploy", "cleanup"}:
+    if not isinstance(value, dict) or set(value) - {"environment", "email", "agree_tos", "profile", "challenge", "preferred_chain", "renewal", "deploy", "cleanup"}:
         raise ValueError("unsupported tls.server.acme settings")
     if value.get("environment", "production") not in ("production", "staging"):
         raise ValueError("ACME environment must be production or staging")
@@ -34,6 +35,9 @@ def validate(server: dict) -> None:
         raise ValueError("ACME requires explicit agree_tos: true")
     if value.get("profile", "shortlived") != "shortlived" or value.get("challenge", "http-01") != "http-01":
         raise ValueError("ACME IP requires shortlived and http-01")
+    preferred_chain = value.get("preferred_chain", "ISRG Root X2")
+    if not isinstance(preferred_chain, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9 ._-]{0,63}", preferred_chain):
+        raise ValueError("invalid ACME preferred_chain")
     email = value.get("email")
     if email is not None and (not isinstance(email, str) or not re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", email) or len(email) > 254):
         raise ValueError("invalid ACME contact email")

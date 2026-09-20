@@ -1,4 +1,6 @@
-# Standalone 3proxy setup 2.5.1
+# Standalone 3proxy setup 2.5.2
+
+Версия 2.5.2 добавляет ACME `preferred_chain` для IP-сертификатов. По умолчанию запрашивается цепочка с `ISRG Root X2`; после выдачи фактический issuer верхнего сертификата проверяется до deploy, поэтому молчаливый fallback Certbot отклоняется.
 
 Upstream: [3proxy/3proxy](https://github.com/3proxy/3proxy).
 
@@ -350,6 +352,7 @@ tls:
       email: admin@example.com
       profile: shortlived
       challenge: http-01
+      preferred_chain: ISRG Root X2
       renewal:
         enabled: true
         interval_minutes: 60
