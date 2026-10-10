@@ -889,10 +889,21 @@ class RenderingTests(unittest.TestCase):
         data["listeners"][3]["listen_ip"] = "192.0.2.20"
         config_tool.validate(data)
         rendered = config_tool.render_3proxy(data)
-        self.assertIn("socks -i127.0.0.1 -p1080 -Ni203.0.113.10", rendered)
+        self.assertIn("socks -i127.0.0.1 -p1080 -Ni127.0.0.1", rendered)
         self.assertIn("socks -i0.0.0.0 -p1081 -Ni203.0.113.10", rendered)
         self.assertIn("proxy -i192.0.2.20 -p8080", rendered)
         self.assertIn("proxy -i0.0.0.0 -p8081", rendered)
+
+    def test_udp_relay_uses_inherited_loopback_bind_without_exposing_firewall_ports(self) -> None:
+        data = make_config(include_https=False)
+        data["server"]["listen_ip"] = "127.0.0.1"
+        config_tool.validate(data)
+        rendered = config_tool.render_3proxy(data)
+        self.assertIn("socks -i127.0.0.1 -p1080 -Ni127.0.0.1", rendered)
+        self.assertIn("socks -i127.0.0.1 -p1081 -Ni127.0.0.1", rendered)
+        self.assertNotIn("-Ni203.0.113.10", rendered)
+        from firewall import required_rules
+        self.assertEqual(required_rules(data), [])
 
     def test_logging_rotation_compression_and_systemd_contract(self) -> None:
         data = make_config(include_https=False)

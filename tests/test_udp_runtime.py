@@ -1,6 +1,6 @@
 """Opt-in SOCKS5 UDP regressions for the retained 3proxy 1.0.0 patch.
 
-Set ``THREEPROXY_BINARY`` to the patched 3proxy executable to run the two
+Set ``THREEPROXY_BINARY`` to the patched 3proxy executable to run the
 process-level tests.  The default test run remains hermetic and only exercises
 the wire-parser fixtures.
 
@@ -389,12 +389,13 @@ class ThreeProxyUdpRuntimeTests(unittest.TestCase):
         name: str,
         reservation: _TcpPortReservation,
         parent_port: int | None = None,
+        config_text: str | None = None,
     ) -> Iterator[_RunningProxy]:
         directory = root / name
         directory.mkdir(mode=0o700)
         config_path = directory / "3proxy.cfg"
         config_path.write_text(
-            _render_config(reservation.port, parent_port),
+            config_text if config_text is not None else _render_config(reservation.port, parent_port),
             encoding="utf-8",
             newline="\n",
         )
@@ -474,6 +475,33 @@ class ThreeProxyUdpRuntimeTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix="threeproxy-udp-direct-") as temporary, _UdpEchoServer() as echo:
             with self._running_proxy(Path(temporary), "direct", listener) as direct:
                 self._run_and_assert(direct, echo, b"direct-retained-patch\x00roundtrip")
+
+    def test_generated_loopback_udp_advertises_reachable_relay(self) -> None:
+        from unittest import mock
+        from test_config import config_tool, make_config
+
+        for override in (False, True):
+            with self.subTest(listener_override=override):
+                listener = _reserve_high_tcp_port()
+                self.addCleanup(listener.release)
+                with tempfile.TemporaryDirectory(prefix="threeproxy-udp-generated-") as temporary, _UdpEchoServer() as echo:
+                    root = Path(temporary)
+                    data = make_config(mode="iponly", include_https=False)
+                    data["access"]["allowed_client_cidrs"] = ["127.0.0.1/32"]
+                    data["upstreams"] = {}
+                    data["listeners"] = [data["listeners"][0]]
+                    data["listeners"][0]["port"] = listener.port
+                    if override:
+                        data["listeners"][0]["listen_ip"] = LOOPBACK
+                    else:
+                        data["server"]["listen_ip"] = LOOPBACK
+                    config_tool.validate(data)
+                    paths = config_tool.paths(None)
+                    paths["LOG_DIR"] = str(root)
+                    with mock.patch.object(config_tool, "paths", return_value=paths):
+                        rendered = config_tool.render_3proxy(data)
+                    with self._running_proxy(root, "generated", listener, config_text=rendered) as direct:
+                        self._run_and_assert(direct, echo, b"generated-loopback-udp")
 
     def test_one_hop_socks5_parent_udp_roundtrip(self) -> None:
         parent_listener = _reserve_high_tcp_port()

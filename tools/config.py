@@ -515,7 +515,9 @@ def render_3proxy(data: dict[str, Any]) -> str:
             lines.append("deny *")
         bind_ip = listener_ip(data, listener)
         if listener["protocol"] == "socks5":
-            nat = f" -Ni{public_ip}" if "udp" in listener["capabilities"] else ""
+            # A loopback UDP socket must advertise an address reachable on loopback.
+            relay_ip = bind_ip if ipaddress.ip_address(bind_ip).is_loopback else public_ip
+            nat = f" -Ni{relay_ip}" if "udp" in listener["capabilities"] else ""
             lines.append(f"socks -i{bind_ip} -p{listener['port']}{nat}")
         else:
             lines.append(f"proxy -i{bind_ip} -p{listener['port']}")

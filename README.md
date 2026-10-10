@@ -1,4 +1,9 @@
-# Standalone 3proxy setup 2.5.2
+# Standalone 3proxy setup 2.5.3
+
+Версия 2.5.3 исправляет адрес UDP-релея для SOCKS5 listeners на loopback:
+UDP ASSOCIATE сообщает локальный адрес привязки вместо публичного IP сервера.
+Для публичных listeners сохраняется публичный IP; локальные UDP listeners
+не создают разрешающих правил firewall для внешних клиентов.
 
 Версия 2.5.2 добавляет ACME `preferred_chain` для IP-сертификатов. По умолчанию запрашивается цепочка с `ISRG Root X2`; после выдачи фактический issuer верхнего сертификата проверяется до deploy, поэтому молчаливый fallback Certbot отклоняется.
 
