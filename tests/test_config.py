@@ -270,6 +270,18 @@ class PrimitiveApiTests(unittest.TestCase):
 
 
 class ValidationTests(unittest.TestCase):
+    def test_previous_source_pin_is_rejected_until_explicit_migration(self) -> None:
+        data = make_config()
+        data["install"] = {
+            "version": "1.0.0",
+            "source_url": "https://github.com/3proxy/3proxy/archive/refs/tags/1.0.0.tar.gz",
+            "sha256": "35b07de1046f3aaeac4a7085101b7e5c453efa3527cbdc42a84690366c7ecfa8",
+        }
+        with self.assertRaisesRegex(ValueError, "pinned to 3proxy 1.0.3"):
+            config_tool.validate(data)
+        data["install"] = make_config()["install"]
+        config_tool.validate(data)
+
     def test_complete_v2_topology_is_valid(self) -> None:
         data = make_config()
         self.assertIsNone(config_tool.validate(data))
@@ -373,9 +385,9 @@ class ValidationTests(unittest.TestCase):
     def test_install_server_logging_and_probe_constraints(self) -> None:
         cases = [
             ("install mapping", lambda d: d.__setitem__("install", []), "install must be a mapping"),
-            ("version pin", lambda d: d["install"].__setitem__("version", "0.9.7"), "pinned to 3proxy 1.0.0"),
+            ("version pin", lambda d: d["install"].__setitem__("version", "0.9.7"), "pinned to 3proxy 1.0.3"),
             ("pinned sha", lambda d: d["install"].__setitem__("sha256", "A" * 64), "pinned official"),
-            ("official source", lambda d: d["install"].__setitem__("source_url", "https://example.test/1.0.0.tgz"), "pinned official"),
+            ("official source", lambda d: d["install"].__setitem__("source_url", "https://example.test/1.0.3.tgz"), "pinned official"),
             ("server mapping", lambda d: d.__setitem__("server", []), "server must be a mapping"),
             ("public IP", lambda d: d["server"].__setitem__("public_ip", "not-an-ip"), None),
             ("listen IP", lambda d: d["server"].__setitem__("listen_ip", "not-an-ip"), None),
@@ -999,7 +1011,7 @@ class CliTests(ConfigCliMixin, unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             manifest = Path(directory) / "manifest.json"
             common = (
-                "--version", "1.0.0",
+                "--version", "1.0.3",
                 "--source-sha", "source-sha",
                 "--patch-sha", "patch-sha",
                 "--build-profile", config_tool.BUILD_PROFILE,
@@ -1015,7 +1027,7 @@ class CliTests(ConfigCliMixin, unittest.TestCase):
                     "build_profile": "cmake-openssl",
                     "patchset_sha256": "patch-sha",
                     "source_sha256": "source-sha",
-                    "version": "1.0.0",
+                    "version": "1.0.3",
                 },
             )
             self.assertTrue(manifest.read_bytes().endswith(b"\n"))

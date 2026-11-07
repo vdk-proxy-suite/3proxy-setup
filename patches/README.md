@@ -1,6 +1,6 @@
-# Patch status for 3proxy 1.0.0
+# Patch status for 3proxy 1.0.3
 
-The installer applies exactly one local patch to the official 3proxy 1.0.0 tag:
+The installer applies exactly one local patch to the official 3proxy 1.0.3 tag:
 
 - `0004-separate-socks5-reply-buffer.patch` keeps a SOCKS5 parent reply in a
   separate buffer, uses the correct IPv4/IPv6 offsets, and safely consumes a
@@ -15,7 +15,7 @@ Three patches shipped by earlier setup releases are intentionally removed:
 - `0005-avoid-second-udp-parent-connect.patch` is superseded by upstream commit
   `eca362a`; retaining it could skip authentication/ACL side effects
 
-The retained patch must be dry-run applied to a clean 1.0.0 source tree and the
+The retained patch must be dry-run applied to a clean 1.0.3 source tree and the
 direct plus one-hop SOCKS5 UDP regression suite must pass before every release.
 Runtime chaining is verified with an IPv4 BND relay; domain/IPv6 reply framing is
 covered by wire fixtures because upstream 3proxy stores the UDP relay only for

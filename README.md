@@ -1,4 +1,9 @@
-# Standalone 3proxy setup 2.5.3
+# Standalone 3proxy setup 2.5.4
+
+Версия 2.5.4 обновляет официальный upstream до 3proxy 1.0.3 с сохранением
+SOCKS5 BND parser fix и обязательной OpenSSL-сборки. Генератор экранирует
+литеральные `$` и кавычки в local/upstream credentials для нового parser.
+Для обновления установленного binary нужен `update` или `all`.
 
 Версия 2.5.3 исправляет адрес UDP-релея для SOCKS5 listeners на loopback:
 UDP ASSOCIATE сообщает локальный адрес привязки вместо публичного IP сервера.
@@ -9,7 +14,7 @@ UDP ASSOCIATE сообщает локальный адрес привязки в
 
 Upstream: [3proxy/3proxy](https://github.com/3proxy/3proxy).
 
-Пакет устанавливает 3proxy 1.0.0 из проверенного tag-архива, собирает основной
+Пакет устанавливает 3proxy 1.0.3 из проверенного tag-архива, собирает основной
 binary с обязательным OpenSSL client support, создаёт выбранные listeners и
 запускает health-check. Рассчитан на Ubuntu/Debian с `apt-get`, `systemd` и
 доступом в интернет.
@@ -56,19 +61,19 @@ SOCKS5/HTTP listeners к одному upstream. Версия 2.0.0 добави�
 без HTTPS listener, direct, SOCKS5/HTTP/HTTPS parents, strong/iponly access, UDP
 и `monitor_v1` остаются совместимыми.
 
-## Что изменилось в 3proxy 1.0.0
+## Закреплённый 3proxy 1.0.3
 
 Исходник жёстко закреплён за официальным тегом и SHA-256:
 
 ```text
-version: 1.0.0
-source:  https://github.com/3proxy/3proxy/archive/refs/tags/1.0.0.tar.gz
-sha256:  35b07de1046f3aaeac4a7085101b7e5c453efa3527cbdc42a84690366c7ecfa8
+version: 1.0.3
+source:  https://github.com/3proxy/3proxy/archive/refs/tags/1.0.3.tar.gz
+sha256:  464553674be2b6d4f36c007604fb547df7841a8277f8282a3e3cda88134e0708
 ```
 
 Три из четырёх прежних UDP-over-SOCKS патчей больше не применяются: их логика
 либо уже вошла в upstream, либо была заменена новой официальной реализацией.
-Сохранён только перенесённый на 1.0.0 parser fix для SOCKS5 BND reply; он
+Сохранён только применимый к 1.0.3 parser fix для SOCKS5 BND reply; он
 предотвращает перезапись request buffer, исправляет offsets IPv4/IPv6 и безопасно
 считывает domain-form ответ. Фактический UDP relay в поддерживаемой runtime-схеме
 по-прежнему использует IPv4 BND. Подробности находятся в `patches/README.md`.
@@ -79,6 +84,32 @@ sha256:  35b07de1046f3aaeac4a7085101b7e5c453efa3527cbdc42a84690366c7ecfa8
 реальный combined runtime-маршрут TLS client → HTTPS listener → 3proxy → HTTPS
 parent. На входе проверяются CA и IP SAN, на выходе — CA и ожидаемый DNS SNI;
 parent дополнительно валидирует сам CONNECT request.
+
+## Обновление до 2.5.4 / 3proxy 1.0.3
+
+В приватном YAML замените **весь** блок `install` блоком из актуального
+`config.example.yaml` (version, source_url и sha256). Старый pin 1.0.0
+отклоняется до остановки сервиса; автоматической подмены источника нет.
+Остальные настройки listeners, instance ID, маршрутов и TLS сохраняются.
+Credentials в YAML задаются буквально: удваивать `$` или кавычки вручную не нужно.
+
+Из новой распакованной папки выполните:
+
+```bash
+sudo ./setup3proxy.sh update --config /secure/path/config.yaml --update-existing
+```
+
+`--update-existing` разрешает обслуживание существующего instance из новой
+папки. Для прежней установки без instance ID дополнительно нужен `--legacy`.
+Не используйте первым шагом `update --instance ID`: сохранённый на VM YAML
+пока содержит старый pin. После успешного обновления сохранённый YAML и
+управляющие скрипты обновлены, и `--instance ID` снова можно использовать.
+
+`reconfigure` не заменяет binary и для этого перехода недостаточно.
+Обновление останавливает выбранный instance перед сборкой: активные соединения
+оборвутся, требуется окно обслуживания. При ошибке после backup штатный
+rollback восстанавливает binary, конфигурацию, PKI и состояние сервиса.
+Сохраните предыдущий setup-пакет и YAML для управления восстановленной версией.
 
 ## Изолированные экземпляры (2.3.0)
 
@@ -189,7 +220,7 @@ sudo ./setup3proxy.sh reconfigure
 ```
 
 `reconfigure` не обновляет 3proxy. При переходе с 1.x setup-пакета на 2.x
-обязательно запускайте `all`, чтобы собрать и установить 3proxy 1.0.0.
+обязательно запускайте `all`, чтобы собрать и установить 3proxy 1.0.3.
 В существующем приватном YAML замените весь `install` block значениями из
 `config.example.yaml`. Новые `tls`, `https_primary` и HTTPS listeners не нужны,
 пока используется только прежняя direct/SOCKS5/HTTP topology.
@@ -323,11 +354,11 @@ parent 1000 connect+s ...
 работает только по whitelist и не требует Basic auth, удалите одновременно
 `username` и `password`; указывать только одно из двух запрещено.
 
-У закреплённого upstream 3proxy 1.0.0 есть особенность обработки повторного
+В upstream 3proxy есть особенность обработки повторного
 CONNECT: после отклонения credentials HTTPS-parent с `407` frontend иногда
 возвращает клиенту вводящий в заблуждение `200 Connection established`, после
 чего туннель закрывается без передачи данных. Это воспроизводится и до 2.3.0;
-данный релиз не исправляет upstream parser и не меняет pin/patchset. Проверка
+релиз 2.5.4 не исправляет этот CONNECT parser. Проверка
 неверного пароля теперь детерминированно воспроизводит этот случай и требует
 фактический parent `407`, отсутствие успешной авторизации, ноль переданных
 байтов и ноль соединений с target (включая обходной direct). Сам по себе

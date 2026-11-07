@@ -29,9 +29,9 @@ MANAGED_TLS_CA_FILE = f"{MANAGED_TLS_DIR}/ca.crt"
 MANAGED_TLS_SERVER_CERT_FILE = f"{MANAGED_TLS_DIR}/server.crt"
 MANAGED_TLS_SERVER_KEY_FILE = f"{MANAGED_TLS_DIR}/server.key"
 BUILD_PROFILE = "cmake-openssl"
-INSTALL_VERSION = "1.0.0"
-INSTALL_SOURCE_URL = "https://github.com/3proxy/3proxy/archive/refs/tags/1.0.0.tar.gz"
-INSTALL_SHA256 = "35b07de1046f3aaeac4a7085101b7e5c453efa3527cbdc42a84690366c7ecfa8"
+INSTALL_VERSION = "1.0.3"
+INSTALL_SOURCE_URL = "https://github.com/3proxy/3proxy/archive/refs/tags/1.0.3.tar.gz"
+INSTALL_SHA256 = "464553674be2b6d4f36c007604fb547df7841a8277f8282a3e3cda88134e0708"
 
 
 def load_config(path: Path) -> dict[str, Any]:
@@ -246,11 +246,11 @@ def validate(data: dict[str, Any]) -> None:
     if not isinstance(install, dict):
         raise ValueError("install must be a mapping")
     if install.get("version") != INSTALL_VERSION:
-        raise ValueError("this release is pinned to 3proxy 1.0.0")
+        raise ValueError("this release is pinned to 3proxy 1.0.3")
     if install.get("source_url") != INSTALL_SOURCE_URL:
-        raise ValueError("install.source_url must be the pinned official 3proxy 1.0.0 tag archive")
+        raise ValueError("install.source_url must be the pinned official 3proxy 1.0.3 tag archive")
     if install.get("sha256") != INSTALL_SHA256:
-        raise ValueError("install.sha256 must match the pinned official 3proxy 1.0.0 tag archive")
+        raise ValueError("install.sha256 must match the pinned official 3proxy 1.0.3 tag archive")
 
     server = data.get("server")
     if not isinstance(server, dict):
@@ -423,13 +423,21 @@ def validate(data: dict[str, Any]) -> None:
         raise ValueError("at least one STUN server is required")
 
 
+def config_token(value: str) -> str:
+    """Preserve literal dollars and quotes through the 3proxy 1.0.3 parser."""
+    escaped = value.replace("$", "$$")
+    if '"' in escaped:
+        return '"' + escaped.replace('"', '""') + '"'
+    return escaped
+
+
 def parent_line(data: dict[str, Any], name: str) -> str:
     upstream = data["upstreams"][name]
     parent_type = {"socks5": "socks5", "http": "connect+", "https": "connect+s"}[upstream["type"]]
     username, password = upstream_credentials(upstream, name)
     fields: list[Any] = ["parent", 1000, parent_type, upstream["host"], upstream["port"]]
     if username is not None:
-        fields.extend([username, password])
+        fields.extend([config_token(username), config_token(password)])
     return " ".join(str(field) for field in fields)
 
 
@@ -456,7 +464,7 @@ def render_3proxy(data: dict[str, Any]) -> str:
         'logformat "-|+_Gv1|%t|%.|%D|%N|%p|%E|%U|%C|%c|%R|%r|%Q|%q|%n|%O|%I|%h|%T"',
         "timeouts 1 5 30 60 180 1800 15 60 15 5",
         "maxconn 1000",
-        *([f"users {user}:CL:{password}"] if strong_listener_present else []),
+        *([f"users {config_token(f'{user}:CL:{password}')}"] if strong_listener_present else []),
         "",
     ]
     if has_https_listener(data):
@@ -501,7 +509,7 @@ def render_3proxy(data: dict[str, Any]) -> str:
             lines.append("auth strong")
             if listener["protocol"] == "socks5" and "udp" not in listener["capabilities"]:
                 lines.append("deny * * * * UDPASSOC")
-            lines.append(f"allow {user}")
+            lines.append(f"allow {config_token(user)}")
             if route is not None:
                 lines.append(route)
         else:

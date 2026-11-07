@@ -1124,6 +1124,36 @@ class GeneratedHttpsBridgeRuntimeTests(unittest.TestCase):
             self.assertFalse(parent.tls_errors, parent.tls_errors)
             self.assertFalse(parent.errors, parent.errors)
 
+    def test_literal_dollars_and_quotes_survive_local_and_parent_auth(self) -> None:
+        from unittest import mock
+
+        local_user = 'local$"dummy'
+        local_password = 'local$$"pass$'
+        parent_user = 'parent$"dummy'
+        parent_password = 'parent$$"pass$'
+        listener_port = _unused_loopback_port()
+        payload = b"literal-credentials"
+        with mock.patch.dict(globals(), DUMMY_LOCAL_USER=local_user,
+                             DUMMY_LOCAL_PASSWORD=local_password,
+                             DUMMY_UPSTREAM_USER=parent_user):
+            with _SentinelTarget() as sentinel, _TlsConnectParent(
+                self.server_certificate, self.server_key,
+                ("127.0.0.1", sentinel.port),
+                expected_username=parent_user, expected_password=parent_password,
+            ) as parent:
+                with self._running_proxy(
+                    "literal-auth", listener_port, parent.port, self.ca_certificate,
+                    upstream_password=parent_password,
+                ) as running:
+                    result = self._proxy_connect(
+                        listener_port, sentinel.port, (local_user, local_password), payload)
+                    self.assertEqual(result.status, 200, running.diagnostics())
+                    self.assertEqual(result.tunneled, SENTINEL_PREFIX + payload)
+                    self.assertTrue(parent.wait_for_attempt())
+                self.assertIn(_basic_value(parent_user, parent_password), parent.authorization_values)
+                self.assertEqual(sentinel.payloads, [payload])
+                self.assertFalse(parent.errors, parent.errors)
+
     def test_multiple_generic_socks_listeners_share_verified_https_parent(self) -> None:
         first_port = _unused_loopback_port()
         second_port = _unused_loopback_port()
@@ -1432,7 +1462,7 @@ class GeneratedHttpsBridgeRuntimeTests(unittest.TestCase):
         listener_port = _unused_loopback_port()
         payload = b"must-not-pass-upstream-auth"
         wrong_dummy_password = "WrongRuntimeParentDummy_41"
-        # Pinned 1.0.0 can report a misleading frontend 200 when the target ends in 2.
+        # Upstream can report a misleading frontend 200 when the target ends in 2.
         # Exercise that known response-parser quirk deterministically, and prove that
         # parent authorization and application transport remain closed independently.
         with _SentinelTarget(port_last_digit=2) as sentinel, _TlsConnectParent(

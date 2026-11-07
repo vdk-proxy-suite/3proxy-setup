@@ -1,4 +1,4 @@
-"""Opt-in SOCKS5 UDP regressions for the retained 3proxy 1.0.0 patch.
+"""Opt-in SOCKS5 UDP regressions for the retained 3proxy 1.0.3 patch.
 
 Set ``THREEPROXY_BINARY`` to the patched 3proxy executable to run the
 process-level tests.  The default test run remains hermetic and only exercises
@@ -366,7 +366,7 @@ def _socks_udp_roundtrip(proxy_port: int, target_port: int, body: bytes) -> _Udp
 
 @unittest.skipUnless(
     bool(BINARY_ENV),
-    "set THREEPROXY_BINARY to the patched 3proxy 1.0.0 executable (runtime tests are opt-in)",
+    "set THREEPROXY_BINARY to the patched 3proxy 1.0.3 executable (runtime tests are opt-in)",
 )
 class ThreeProxyUdpRuntimeTests(unittest.TestCase):
     @classmethod

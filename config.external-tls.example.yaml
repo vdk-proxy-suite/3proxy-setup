@@ -3,9 +3,9 @@
 instance:
   id: main
 install:
-  version: 1.0.0
-  source_url: https://github.com/3proxy/3proxy/archive/refs/tags/1.0.0.tar.gz
-  sha256: 35b07de1046f3aaeac4a7085101b7e5c453efa3527cbdc42a84690366c7ecfa8
+  version: 1.0.3
+  source_url: https://github.com/3proxy/3proxy/archive/refs/tags/1.0.3.tar.gz
+  sha256: 464553674be2b6d4f36c007604fb547df7841a8277f8282a3e3cda88134e0708
 server:
   public_ip: 203.0.113.10
   listen_ip: 0.0.0.0
