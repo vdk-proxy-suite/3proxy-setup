@@ -29,6 +29,49 @@ def data():
 
 
 class AcmeSchemaTests(unittest.TestCase):
+    def test_dns_auto_uses_dns_identifier_and_does_not_pin_a_resolved_ip(self):
+        value = data()
+        value["tls"]["server"] = {"mode": "acme", "identifiers": ["PROXY.example.test"],
+                                  "acme": {"agree_tos": True, "profile": "auto"}}
+        policy.validate(value["tls"]["server"])
+        args = acme.certbot_args(instance.paths("a"), value, first=True)
+        self.assertEqual(args[args.index("-d") + 1], "proxy.example.test")
+        self.assertEqual(args[args.index("--required-profile") + 1], "classic")
+        self.assertNotIn("--ip-address", args)
+        self.assertNotIn("--preferred-chain", args)
+        before = policy.lineage(value)
+        value["server"]["public_ip"] = "198.51.100.20"
+        self.assertEqual(policy.lineage(value), before)
+
+    def test_mixed_sans_require_shortlived_and_stable_canonical_identity(self):
+        value = data()
+        value["tls"]["server"] = {"mode": "acme",
+                                  "identifiers": ["proxy.example.test", "2001:db8::1", "192.0.2.1"],
+                                  "acme": {"agree_tos": True}}
+        policy.validate(value["tls"]["server"])
+        args = acme.certbot_args(instance.paths("a"), value, first=True)
+        self.assertEqual(args.count("--ip-address"), 2)
+        self.assertEqual(args.count("-d"), 1)
+        self.assertEqual(policy.settings(value)["profile"], "shortlived")
+        original = policy.candidate_identity(value, "fingerprint")
+        lineage = policy.lineage(value)
+        value["tls"]["server"]["identifiers"] = ["192.0.2.1", "2001:0DB8:0:0:0:0:0:1", "PROXY.example.test."]
+        self.assertEqual(policy.candidate_identity(value, "fingerprint"), original)
+        self.assertEqual(policy.lineage(value), lineage)
+        value["tls"]["server"]["acme"]["profile"] = "classic"
+        with self.assertRaisesRegex(ValueError, "shortlived"):
+            policy.validate(value["tls"]["server"])
+
+    def test_dns_profile_change_does_not_reuse_old_lineage_or_candidate(self):
+        value = data()
+        value["tls"]["server"] = {"mode": "acme", "identifiers": ["proxy.example.test"],
+                                  "acme": {"agree_tos": True}}
+        before = policy.lineage(value), policy.candidate_identity(value, "sha")
+        value["tls"]["server"]["acme"]["profile"] = "shortlived"
+        after = policy.lineage(value), policy.candidate_identity(value, "sha")
+        self.assertNotEqual(before[0], after[0])
+        self.assertNotEqual(before[1], after[1])
+
     def test_defaults_and_explicit_schedule(self):
         value=data();config.validate(value)
         self.assertEqual(policy.settings(value)["interval_minutes"],60)

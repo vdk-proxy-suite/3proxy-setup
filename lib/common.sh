@@ -65,6 +65,13 @@ restore_latest_backup() {
   fi
   rm -f -- "$INSTANCE_STATE/pending-client-ca.crt"
   rm -rf -- "$INSTANCE_STATE/pending-server-tls"
+  rm -rf -- "$INSTANCE_STATE/pending-certificates"
+  rm -f -- "$INSTANCE_STATE/upstreams.pending.json"
+  if [[ -f "$BACKUP_DIR/upstreams.json" ]]; then
+    install -m 600 "$BACKUP_DIR/upstreams.json" "$INSTANCE_STATE/upstreams.json"
+  else
+    rm -f -- "$INSTANCE_STATE/upstreams.json"
+  fi
   rm -rf -- ${CONFIG_DIR}/tls
   if [[ -d "$BACKUP_DIR/tls" ]]; then
     install -d -m 755 ${CONFIG_DIR}

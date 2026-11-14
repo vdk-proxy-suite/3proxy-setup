@@ -50,6 +50,12 @@ class BuildArchiveTests(unittest.TestCase):
     }
 
     EXCLUDED_FILES = {
+        "tmp/old-runtime/summary.json": "private runtime state\n",
+        "deployment-notes.json": "private deployment metadata\n",
+        "runtime/state.json": "private runtime state\n",
+        ".credentials-interrupted.yaml": "local_auth: interrupted-secret-write\n",
+        ".test-work/private-profile.yaml": "private test deployment\n",
+        ".test-work/3proxy-1.0.3/build/bin/3proxy": "compiled binary\n",
         ".agents/session.json": "{}\n",
         ".env": "SECRET=do-not-package\n",
         ".env.local": "SECRET=do-not-package\n",

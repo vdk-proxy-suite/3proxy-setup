@@ -127,6 +127,19 @@ class OwnershipLifecycleTests(unittest.TestCase):
         self.assertEqual(instance.read_manifest(self.p)["status"], "installed")
         self.assertFalse(any(call[0] == "systemctl" for call in self.calls))
 
+    def test_cleanup_removes_named_pending_private_material_and_route_snapshots(self):
+        state = Path(self.p["INSTANCE_STATE"])
+        pending = state / "pending-certificates/dns"
+        pending.mkdir(parents=True)
+        (pending / "server.key").write_text("fixture private material")
+        for name in ("upstreams.json", "upstreams.pending.json"):
+            (state / name).write_text("{}")
+        self.clean()
+        self.assertFalse((state / "pending-certificates").exists())
+        self.assertFalse((state / "upstreams.json").exists())
+        self.assertFalse((state / "upstreams.pending.json").exists())
+        self.assertTrue((state / "manifest.json").exists())
+
     def test_manifest_path_injection_rejected_before_service_actions(self):
         self.manifest["paths"] = dict(self.p, CONFIG_DIR="/etc")
         instance.atomic_json(Path(self.p["INSTANCE_STATE"]) / "manifest.json", self.manifest)

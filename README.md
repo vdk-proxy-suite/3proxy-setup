@@ -1,4 +1,199 @@
-# Standalone 3proxy setup 2.5.4
+# Standalone 3proxy setup 2.6.0
+
+## IPv4, IPv6 и DNS в 2.6.0
+
+Новый opt-in формат `schema_version: 2` разделяет локальный bind, публичный
+endpoint, TLS identity и ожидаемый адрес выхода. Старые YAML без версии схемы,
+включая `tls.server.mode: acme_ip`, сохраняют прежнее поведение. Существующие
+пароли, ID, порты и сертификаты не изменяются автоматически. Upstream binary
+остаётся закреплённым 3proxy 1.0.3 с OpenSSL и сохранённым SOCKS BND parser fix.
+
+Начальный профиль — `config.dualstack.example.yaml`. Это фиктивные значения:
+задайте свой домен, адреса выхода и credentials в отдельном приватном YAML.
+По умолчанию пример запрашивает **staging** сертификат, которому обычные клиенты
+не доверяют. Для production укажите `environment: production` после проверки.
+
+Распаковывайте каждый instance в отдельную папку с закрытыми правами, чтобы
+`--purge-setup` впоследствии мог проверить и удалить её:
+
+```bash
+umask 077
+mkdir -p ~/3proxy-main-dev
+unzip 3proxy-setup-2.6.0.zip -d ~/3proxy-main-dev
+cd ~/3proxy-main-dev/3proxy-setup
+cp config.dualstack.example.yaml config.yaml
+chmod 600 config.yaml
+# Отредактируйте адреса и сертификаты, затем задайте credentials без shell history:
+python3 tools/set_credentials.py --config config.yaml
+sudo ./setup3proxy.sh all --config config.yaml
+```
+
+Сертификаты сохраняются под `tls/<certificate-id>` своего instance. Отдельный
+certificate ID не меняет identity владельца manifest. Cleanup понимает
+объединённое представление IPv4/IPv6 wildcard-правил UFW и удаляет такую запись
+только при подтверждённом владении обоими семействами.
+
+```yaml
+schema_version: 2
+listeners:
+  - id: https_direct
+    protocol: https
+    port: 38443
+    bind: ["::"]
+    accept_families: [ipv4, ipv6]
+    endpoint:
+      host: proxy.example.com
+      families: [ipv4, ipv6]
+    tls_certificate: public-dns
+    parent: direct
+    outbound:
+      family: prefer_ipv4
+    capabilities: [tcp]
+```
+
+Это фрагмент; полный набор обязательных полей приведён в примере.
+`bind` принимает только локальные IP. Список может содержать конкретный IPv4 и
+конкретный IPv6 на одном порту. `::` означает dual-stack и требует системного
+`net.ipv6.bindv6only=0`: setup проверяет его, но не меняет глобально. Пересечение
+`::` с `0.0.0.0` на одном порту отклоняется. `accept_families` описывает фактически
+требуемые семейства входа; `endpoint.families` задаёт семейства внешней проверки.
+IPv4 и IPv6 проверяются отдельно, успех одного не скрывает отказ другого.
+
+В `iponly` допустимы IPv4/IPv6 CIDR, но не открытые `/0`. Для dual-stack сокета
+IPv4 allowlist преобразуется в IPv4-mapped IPv6. Отдельный deny запрещает широкому
+IPv6 allowlist неявно разрешать IPv4-клиентов. Loopback binds не создают публичных
+proxy-правил UFW. HTTP-01 может отдельно требовать входящий TCP/80.
+
+### Сертификаты и автоматический выбор identifier
+
+```yaml
+tls:
+  certificates:
+    public-dns:
+      mode: acme
+      identifiers: [proxy.example.com]
+      acme:
+        environment: production
+        agree_tos: true
+        profile: auto
+        challenge: http-01
+        renewal:
+          enabled: true
+          interval_minutes: 60
+  deploy:
+    time: "05:00"
+    timezone: Europe/Moscow
+```
+
+Каждый HTTPS-listener ссылается на один `tls_certificate`; один сертификат может
+использоваться несколькими listeners. Для разных сертификатов нужны разные
+сокеты — автоматического выбора нескольких сертификатов по SNI на одном сокете нет.
+
+`identifiers` принимает DNS, IPv4 и IPv6, в том числе смешанный список. DNS
+остаётся DNS SAN: его A/AAAA не добавляются в сертификат автоматически. IPv6
+нормализуется, порядок identifiers не меняет identity. URL, порт, wildcard и
+zone ID отклоняются. `profile: auto` выбирает `classic` для DNS-only и `shortlived`
+при наличии IP; явные `classic`, `tlsserver`, `shortlived` проверяются на
+совместимость. Certbot использует `--required-profile`, без скрытого downgrade.
+Срок действия берётся из выданного сертификата; для `shortlived` дополнительно
+проверяется короткий срок. В новом ACME режиме `preferred_chain` необязателен;
+если задан, фактическая цепочка обязана ему соответствовать.
+
+HTTP-01 использует TCP/80 независимо от порта HTTPS proxy. При A+AAAA challenge
+должен быть доступен по обоим семействам. При `manage_ufw: true` setup добавляет
+собственные правила TCP/80 до выпуска; правила cloud firewall пользователь
+настраивает отдельно. Занятый порт 80 не освобождается остановкой чужого сервиса:
+Certbot завершится ошибкой до остановки выбранного proxy instance. DNS-01,
+DuckDNS API token и wildcard в этом релизе не поддерживаются.
+
+Фоновый renewal сохраняет отдельные candidates/status для именованных сертификатов.
+Применение выполняется в существующее окно 05:00 Europe/Moscow одним restart
+выбранного instance. До restart проверяются все обновляемые пары, после него —
+сертификаты на соответствующих listeners. Ошибка восстанавливает предыдущий
+набор целиком. Остановленный instance автоматика не запускает. Production не
+использует staging trust. У нескольких сертификатов одна пара instance timers;
+renewal timer использует минимальный интервал, а отключённые certificates
+пропускаются контроллером. Изменение DNS A/AAAA не перевыпускает DNS-сертификат.
+
+Именованные сертификаты также поддерживают `mode: external` с
+`fullchain_file`, `private_key_file`, необязательным `ca_file`, либо `mode: managed`
+с `validity_days`, `ca_validity_days`, `regenerate_on_setup`. В обоих случаях
+обязателен `identifiers`; вместо старого `dns_names` используется общий список.
+У external проверяется точный набор SAN и сохраняются защищённые копии файлов;
+у managed сохраняется пригодный CA и leaf, а изменение identifiers перевыпускает
+leaf под прежним CA. Private CA автоматически не становится публично доверенным.
+
+### Исходящий маршрут и проверка
+
+`outbound.family` принимает `ipv4`, `ipv6`, `prefer_ipv4`, `prefer_ipv6` и
+отображается в `-4`, `-6`, `-46`, `-64` 3proxy. Это политика разрешения адресов,
+а не гарантия Happy Eyeballs или TCP-failover. Семейство входа от неё независимо.
+
+Для каждого используемого маршрута `probes.egress` задаёт отдельные проверки:
+
+```yaml
+probes:
+  timeout_seconds: 8
+  egress:
+    direct:
+      ipv4:
+        http_host: api.ipify.org
+        http_port: 80
+        expected_ips: ["203.0.113.10"]
+      ipv6:
+        http_host: api6.ipify.org
+        http_port: 80
+        expected_ips: ["2001:db8::10"]
+```
+
+Для upstream используйте его ID вместо `direct`. В схеме 2 старое
+`upstreams.*.expected_egress_ip` заменяется этим блоком. Upstream `host` принимает
+IP/DNS; `resolve_family` задаёт `ipv4`, `ipv6`, `prefer_ipv4`, `prefer_ipv6`.
+Для DNS default — `prefer_ipv4`, для IP — его семейство. Транспортный IP
+разрешается до остановки сервиса и фиксируется до следующего reconfigure.
+Исходный DNS остаётся в YAML. У HTTPS-parent `tls_server_name` остаётся отдельным
+DNS-именем проверки сертификата и SNI; точный транспортный IP не подменяет это имя.
+Прямого fallback при ошибке upstream нет.
+
+VM healthcheck проверяет реальные binds, E2E — все A/AAAA публичного endpoint.
+TLS проверяет имя endpoint, даже когда транспорт подключён к конкретному IPv6.
+JSON содержит семейство, выбранный IP, certificate ID, TLS identity и egress.
+Проверяются GET/CONNECT, отсутствие/неверные credentials и отказ plaintext для
+HTTPS. `--skip-upstreams` пропускает только отдельные прямые проверки родителей;
+проверки маршрутов через listeners сохраняются.
+В 3proxy SOCKS5 может подтвердить начальный handshake до проверки credentials.
+Отрицательный тест доходит до CONNECT и требует явный отказ доступа `REP=2`;
+успешное соединение, timeout и сетевые ошибки не считаются отказом авторизации.
+
+```bash
+sudo python3 tools/healthcheck.py --config config.yaml --scope vm
+python3 tools/healthcheck.py --config config.yaml --scope e2e --skip-upstreams
+sudo python3 tools/acme.py status --instance main-dev
+sudo python3 tools/acme.py renew --instance main-dev
+sudo python3 tools/acme.py test-renewal --instance main-dev
+sudo python3 tools/acme.py deploy --instance main-dev
+```
+
+Для staging E2E нужно явно передать `--proxy-ca-file tools/acme-staging-roots.txt`.
+`test-renewal` запускает Certbot dry-run после первого выпуска и не меняет
+активную пару или candidate; команда нужна для проверки challenge до срока renewal.
+Для managed E2E передайте публичный CA или объединённый CA bundle выбранных
+сертификатов. Private keys на клиент не копируются. Не используйте `-k` или
+`--proxy-insecure` как доказательство исправности TLS.
+
+IPv6 UDP не входит в 2.6.0: новая IPv6 topology должна быть TCP-only. Прежний
+IPv4 UDP сохраняется; для IPv4 UDP в схеме 2 дополнительно нужны
+`server.udp_public_ip` и `server.udp_client_cidr`. Поля старого и нового адресных
+контрактов не смешиваются; setup откажется от неоднозначной конфигурации.
+
+Рекомендуемый переход: новый ID и новые порты, staging, внешний E2E, затем
+production и проверка renewal/deploy. Обновление пакета само по себе не переводит
+`main`/`local` на новую схему. Для сохранения старого поведения оставьте прежний YAML.
+
+Источники: [Let’s Encrypt profiles](https://letsencrypt.org/docs/profiles/),
+[IPv6 validation](https://letsencrypt.org/docs/ipv6-support/),
+[HTTP-01](https://letsencrypt.org/docs/challenge-types/),
+[3proxy network options](https://3proxy.org/doc/man5/3proxy.cfg.5.html).
 
 Версия 2.5.4 обновляет официальный upstream до 3proxy 1.0.3 с сохранением
 SOCKS5 BND parser fix и обязательной OpenSSL-сборки. Генератор экранирует

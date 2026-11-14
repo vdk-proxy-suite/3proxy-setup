@@ -11,6 +11,7 @@ import shutil
 import subprocess
 
 import yaml
+import schema_v2
 
 from instance import atomic_json, guard, read_manifest
 
@@ -18,18 +19,70 @@ from instance import atomic_json, guard, read_manifest
 def required_rules(data: dict) -> list[list[str]]:
     rules = []
     external_udp = False
-    for listener in data["listeners"]:
-        address = listener.get("listen_ip", data["server"]["listen_ip"])
+    for listener in schema_v2.expanded_listeners(data):
+        address = listener.get("listen_ip", data["server"].get("listen_ip"))
         if ipaddress.ip_address(address).is_loopback:
             continue
-        rule = ["allow", f"{listener['port']}/tcp"]
-        if rule not in rules:
-            rules.append(rule)
+        if schema_v2.enabled(data):
+            addresses = ["0.0.0.0", "::"] if address == "::" else [address]
+            for bind in addresses:
+                parsed = ipaddress.ip_address(bind)
+                source = "0.0.0.0/0" if parsed.version == 4 else "::/0"
+                destination = source if parsed.is_unspecified else str(parsed)
+                rule = ["allow", "from", source, "to", destination, "port", str(listener["port"]), "proto", "tcp"]
+                if rule not in rules: rules.append(rule)
+        else:
+            rule = ["allow", f"{listener['port']}/tcp"]
+            if rule not in rules:
+                rules.append(rule)
         external_udp |= "udp" in listener.get("capabilities", [])
     if external_udp:
         rules.append(["allow", "from", data["server"]["udp_client_cidr"], "to", "any",
                       "port", "1024:65535", "proto", "udp"])
+    if schema_v2.enabled(data):
+        for rule in acme_rules(data):
+            if rule not in rules: rules.append(rule)
     return rules
+
+
+def acme_rules(data: dict) -> list[list[str]]:
+    """HTTP-01 is on TCP/80 even when the proxy uses a different port."""
+    import addressing
+    versions = set()
+    for cert in schema_v2.certificates(data).values():
+        if cert.get("mode") != "acme":
+            continue
+        for requested in addressing.identities(cert["identifiers"]):
+            versions.update((4, 6) if requested.kind == "dns" else (4,) if requested.family == "ipv4" else (6,))
+    result = []
+    for version in sorted(versions):
+        network = "0.0.0.0/0" if version == 4 else "::/0"
+        result.append(["allow", "from", network, "to", network, "port", "80", "proto", "tcp"])
+    return result
+
+
+def rule_families(args: list[str]) -> set[int]:
+    versions = set()
+    for index, value in enumerate(args[:-1]):
+        if value in {"from", "to"} and args[index + 1] != "any":
+            try:
+                versions.add(ipaddress.ip_network(args[index + 1], strict=False).version)
+            except ValueError:
+                return set()
+    if len(versions) > 1:
+        return set()
+    return versions or {4, 6}
+
+
+def ufw_ipv6_enabled() -> bool:
+    try:
+        for line in Path("/etc/default/ufw").read_text().splitlines():
+            key, separator, value = line.split("#", 1)[0].partition("=")
+            if separator and key.strip() == "IPV6":
+                return value.strip().strip("\"'").lower() == "yes"
+    except OSError:
+        pass
+    return False
 
 
 def signature(args: list[str]) -> tuple | None:
@@ -87,7 +140,7 @@ def added_rules() -> list[tuple[list[str], str | None]]:
     return rules
 
 
-def configure(p: dict, data: dict) -> None:
+def configure(p: dict, data: dict, *, rules: list[list[str]] | None = None) -> None:
     if not data["server"]["manage_ufw"]:
         return
     if shutil.which("ufw") is None:
@@ -98,13 +151,17 @@ def configure(p: dict, data: dict) -> None:
     if "Status: active" not in status.stdout:
         print("UFW inactive; no firewall changes")
         return
+    planned = required_rules(data) if rules is None else rules
+    if schema_v2.enabled(data) and any(6 in rule_families(rule) for rule in planned) and not ufw_ipv6_enabled():
+        raise ValueError("required IPv6 UFW rules cannot be installed: verify IPV6=yes in /etc/default/ufw; global firewall settings are not changed")
     manifest = read_manifest(p)
     if manifest is None:
         raise ValueError("firewall mutation requires an ownership manifest")
     marker = f"3proxy-setup:{p['INSTANCE_ID'] or 'legacy'}:{manifest['token']}"
     existing = added_rules()
-    for args in required_rules(data):
-        matches = [(rule, comment) for rule, comment in existing if signature(rule) == signature(args)]
+    for args in planned:
+        matches = [(rule, comment) for rule, comment in existing if signature(rule) == signature(args)
+                   and (not schema_v2.enabled(data) or rule_families(rule) >= rule_families(args))]
         if matches:
             print(f"Preserving existing UFW rule for {signature(args)}; no ownership adopted")
             continue
@@ -135,8 +192,18 @@ def neighbor_uses(p: dict, target: list[str]) -> bool:
         if not config.exists():
             return True
         try:
-            rules = required_rules(yaml.safe_load(config.read_text()))
-        except (ValueError, KeyError, TypeError, yaml.YAMLError):
+            neighbor_data = yaml.safe_load(config.read_text())
+            rules = required_rules(neighbor_data)
+        except (ValueError, KeyError, TypeError, AttributeError, yaml.YAMLError):
+            return True
+        # Legacy acme_ip used manually opened HTTP-01 ports. Never remove a new
+        # instance's TCP/80 rule while such a neighbor still relies on renewal.
+        target_signature = signature(target)
+        neighbor_tls = neighbor_data.get("tls", {})
+        if not isinstance(neighbor_tls, dict) or not isinstance(neighbor_tls.get("server", {}), dict):
+            return True
+        if (target_signature and target_signature[:2] == ("tcp", "80")
+                and neighbor_tls.get("server", {}).get("mode") == "acme_ip"):
             return True
         for rule in rules:
             if signature(rule) == signature(target):
@@ -163,6 +230,15 @@ def validate_ownership(p: dict, manifest: dict) -> tuple[list, str]:
         target = signature(args)
         valid_tcp = (target is not None and target[0] == "tcp" and target[1].isdigit()
                      and 1 <= int(target[1]) <= 65535 and args == ["allow", target[1] + "/tcp"])
+        if target and target[0] == "tcp" and target[1].isdigit() and 1 <= int(target[1]) <= 65535 and len(args) == 9:
+            try:
+                source = ipaddress.ip_network(args[2], strict=False)
+                destination = ipaddress.ip_network(args[4], strict=False)
+                valid_tcp |= (source.prefixlen == 0 and source.version == destination.version
+                              and destination.prefixlen in (0, destination.max_prefixlen)
+                              and args == ["allow", "from", args[2], "to", args[4], "port", target[1], "proto", "tcp"])
+            except ValueError:
+                pass
         valid_udp = False
         if target and target[0] == "udp" and target[1] == "1024:65535":
             try:
@@ -185,14 +261,28 @@ def purge(p: dict, manifest: dict, *, execute: bool) -> None:
         print("UFW unavailable; owned rules retained")
         return
     existing = added_rules()
+    handled = []
     for record in records[:]:
+        if record in handled:
+            continue
         args = record["args"]
         target = signature(args)
-        matches = [(rule, comment) for rule, comment in existing if signature(rule) == target]
+        matches = [(rule, comment) for rule, comment in existing if signature(rule) == target
+                   and rule_families(rule) & rule_families(args)]
         if len(matches) != 1 or matches[0][1] != expected:
             print(f"UFW rule {target} retained: ownership comment changed or ambiguous")
             continue
-        if neighbor_uses(p, args):
+        observed_args = matches[0][0]
+        observed_families = rule_families(observed_args)
+        covered = [item for item in records if signature(item["args"]) == target
+                   and rule_families(item["args"]) <= observed_families]
+        owned_families = set().union(*(rule_families(item["args"]) for item in covered))
+        # UFW coalesces matching IPv4 and IPv6 /0 rules into "allow PORT/tcp".
+        # Delete that combined rule only if the manifest owns both families.
+        if not observed_families or not observed_families <= owned_families:
+            print(f"UFW rule {target} retained: not all observed address families are owned")
+            continue
+        if neighbor_uses(p, observed_args):
             print(f"UFW rule {target} retained: another instance may require it")
             continue
         if target[0] == "tcp":
@@ -201,8 +291,11 @@ def purge(p: dict, manifest: dict, *, execute: bool) -> None:
             if listeners.stdout.strip():
                 print(f"UFW rule {target} retained: port is still in use")
                 continue
-        print(f"Remove exclusively owned UFW rule: {args}")
+        delete_args = args if rule_families(args) == observed_families else observed_args
+        print(f"Remove exclusively owned UFW rule: {delete_args}")
+        handled.extend(covered)
         if execute:
-            subprocess.run(["ufw", "--force", "delete", *args], check=True)
-            manifest["ufw_rules"].remove(record)
+            subprocess.run(["ufw", "--force", "delete", *delete_args], check=True)
+            for item in covered:
+                manifest["ufw_rules"].remove(item)
             atomic_json(Path(p["INSTANCE_STATE"]) / "manifest.json", manifest)

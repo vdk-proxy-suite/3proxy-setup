@@ -25,6 +25,7 @@ class FirewallOwnershipTests(unittest.TestCase):
             return subprocess.CompletedProcess(argv, 0, output)
         for target, kwargs in [
             ('shutil.which', dict(return_value='/usr/sbin/ufw')),
+            ('ufw_ipv6_enabled', dict(return_value=True)),
             ('read_manifest', dict(return_value=self.manifest)),
             ('atomic_json', dict(return_value=None)),
             ('added_rules', dict(side_effect=lambda: self.existing.copy())),
@@ -133,6 +134,72 @@ class FirewallOwnershipTests(unittest.TestCase):
         firewall.purge(self.p, self.manifest, execute=False)
         self.assertFalse(any('delete' in call for call in self.calls))
 
+    def test_v2_dualstack_rules_have_distinct_family_ownership(self):
+        from test_schema_v2 import profile
+        self.data = profile(); self.data["server"]["manage_ufw"] = True
+        self.configure()
+        records = self.manifest["ufw_rules"]
+        self.assertEqual(len(records), 4)
+        self.assertEqual([firewall.rule_families(r["args"]) for r in records], [{4}, {6}, {4}, {6}])
+        firewall.validate_ownership(self.p, self.manifest)
+        self.existing = [(r["args"], r["comment"]) for r in records]
+        firewall.purge(self.p, self.manifest, execute=True)
+        deletes = [call for call in self.calls if call[:3] == ["ufw", "--force", "delete"]]
+        self.assertEqual(len(deletes), 4)
+
+    def test_v2_existing_ipv4_rule_does_not_hide_missing_ipv6_rule(self):
+        from test_schema_v2 import profile
+        self.data = profile(); self.data["server"]["manage_ufw"] = True
+        required = firewall.required_rules(self.data)
+        self.existing = [(required[0], "foreign"), (required[2], "foreign"), (required[3], "foreign")]
+        self.configure()
+        self.assertEqual(len(self.manifest["ufw_rules"]), 1)
+        self.assertEqual(firewall.rule_families(self.manifest["ufw_rules"][0]["args"]), {6})
+
+    def test_v2_loopback_does_not_publish_either_family(self):
+        from test_schema_v2 import profile
+        data = profile(); data["listeners"][0]["bind"] = ["127.0.0.1", "::1"]
+        rules = firewall.required_rules(data)
+        self.assertEqual(len(rules), 2)
+        self.assertTrue(all(rule[6] == "80" for rule in rules))
+
+    def test_v2_disabled_ufw_ipv6_is_not_reported_as_success(self):
+        from test_schema_v2 import profile
+        self.data = profile(); self.data["server"]["manage_ufw"] = True
+        with mock.patch.object(firewall, "ufw_ipv6_enabled", return_value=False):
+            with self.assertRaisesRegex(ValueError, "IPV6=yes"):
+                self.configure()
+        self.assertEqual(self.manifest["ufw_rules"], [])
+        self.assertFalse(any(call[:2] == ["ufw", "allow"] for call in self.calls))
+
+    def paired_wildcard_records(self):
+        marker = "3proxy-setup:a:fixture-owner"
+        self.manifest["ufw_rules"] = [dict(args=["allow", "from", network, "to", network, "port", "1080", "proto", "tcp"],
+                                           comment=marker) for network in ("0.0.0.0/0", "::/0")]
+        self.existing = [(["allow", "1080/tcp"], marker)]
+
+    def test_ufw_coalesced_pair_is_deleted_once_when_both_families_are_owned(self):
+        self.paired_wildcard_records()
+        firewall.purge(self.p, self.manifest, execute=True)
+        self.assertEqual(self.manifest["ufw_rules"], [])
+        self.assertEqual([c for c in self.calls if "delete" in c], [["ufw", "--force", "delete", "allow", "1080/tcp"]])
+
+    def test_coalesced_pair_cannot_be_deleted_with_only_one_owned_family(self):
+        self.paired_wildcard_records(); self.manifest["ufw_rules"].pop()
+        firewall.purge(self.p, self.manifest, execute=True)
+        self.assertEqual(len(self.manifest["ufw_rules"]), 1)
+        self.assertFalse(any("delete" in c for c in self.calls))
+
+    def test_coalesced_pair_still_requires_unchanged_comment_and_no_neighbor(self):
+        for conflict in ("comment", "neighbor", "ambiguous"):
+            self.paired_wildcard_records(); self.calls.clear()
+            self.neighbor.return_value = conflict == "neighbor"
+            if conflict == "comment": self.existing[0] = (self.existing[0][0], "foreign")
+            if conflict == "ambiguous": self.existing.append(self.existing[0])
+            firewall.purge(self.p, self.manifest, execute=True)
+            self.assertEqual(len(self.manifest["ufw_rules"]), 2)
+            self.assertFalse(any("delete" in c for c in self.calls))
+
 
 class NeighborRegistryTests(unittest.TestCase):
     def test_neighbor_ports_loopback_and_unknown_state(self):
@@ -151,6 +218,9 @@ class NeighborRegistryTests(unittest.TestCase):
             (neighbor / "requested.yaml").write_text(yaml.safe_dump(data))
             self.assertTrue(real_neighbor_uses(p, ["allow", "1080/tcp"]))
             self.assertFalse(real_neighbor_uses(p, ["allow", "1081/tcp"]))
+            data["tls"] = {"server": {"mode": "acme_ip", "acme": {"agree_tos": True}}}
+            (neighbor / "requested.yaml").write_text(yaml.safe_dump(data))
+            self.assertTrue(real_neighbor_uses(p, ["allow", "from", "::/0", "to", "::/0", "port", "80", "proto", "tcp"]))
             data["listeners"][0]["listen_ip"] = "127.0.0.1"
             (neighbor / "requested.yaml").write_text(yaml.safe_dump(data))
             self.assertFalse(real_neighbor_uses(p, ["allow", "1080/tcp"]))

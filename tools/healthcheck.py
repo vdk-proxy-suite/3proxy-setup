@@ -97,6 +97,8 @@ def socks4_tcp(
     target: str,
     target_port: int,
     timeout: float,
+    *,
+    host_header: str | None = None,
 ) -> str:
     target_ipv4 = socket.gethostbyname(target)
     with socket.create_connection((proxy, port), timeout=timeout) as sock:
@@ -111,7 +113,7 @@ def socks4_tcp(
         recv_exact(sock, 6)
         if version != 0 or status != 0x5A:
             raise RuntimeError(f"SOCKS4 CONNECT failed, status={status}")
-        sock.sendall(f"GET / HTTP/1.1\r\nHost: {target}\r\nConnection: close\r\n\r\n".encode())
+        sock.sendall(f"GET / HTTP/1.1\r\nHost: {host_header or target}\r\nConnection: close\r\n\r\n".encode())
         response_status, body = read_http_response(sock)
     if " 200 " not in response_status:
         raise RuntimeError(f"target HTTP response: {response_status}")
@@ -520,6 +522,10 @@ def main() -> int:
     config = load_config(args.config)
     if args.instance and identity(config) != args.instance:
         parser.error("--instance does not match configuration")
+    if config.get("schema_version") == 2:
+        from healthcheck_v2 import run
+        from config import load_config as load_normalized
+        return run(load_normalized(args.config), args, parser)
     timeout = args.timeout or float(config["probes"]["timeout_seconds"])
     public_ip = config["server"]["public_ip"]
     default_listen_ip = config["server"]["listen_ip"]

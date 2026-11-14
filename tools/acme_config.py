@@ -1,7 +1,10 @@
 """Strict YAML contract and deterministic ACME resource names."""
 from __future__ import annotations
 from pathlib import Path
+import hashlib
+import json
 import re
+import addressing
 
 CERTBOT_VERSION = "5.8.0"
 DIRECTORIES = {
@@ -11,21 +14,59 @@ DIRECTORIES = {
 
 
 def enabled(data: dict) -> bool:
-    return data.get("tls", {}).get("server", {}).get("mode") == "acme_ip"
+    return data.get("tls", {}).get("server", {}).get("mode") in {"acme_ip", "acme"}
+
+
+def identifiers(data: dict) -> tuple[addressing.Identity, ...]:
+    server = data["tls"]["server"]
+    if server.get("mode") == "acme_ip":
+        return addressing.identities([data["server"]["public_ip"]])
+    return addressing.identities(server["identifiers"])
+
+
+def selected_profile(server: dict) -> str:
+    legacy = server.get("mode") == "acme_ip"
+    requested = server["acme"].get("profile", "shortlived" if legacy else "auto")
+    has_ip = legacy or any(item.kind == "ip" for item in addressing.identities(server["identifiers"]))
+    if requested == "auto":
+        requested = "shortlived" if has_ip else "classic"
+    if requested not in {"classic", "tlsserver", "shortlived"} or (has_ip and requested != "shortlived"):
+        raise ValueError("IP identifiers require shortlived; DNS supports classic, tlsserver or shortlived")
+    return requested
+
+
+def lineage(data: dict) -> str:
+    if data["tls"]["server"].get("mode") == "acme_ip":
+        return "ip-" + hashlib.sha256(str(data["server"]["public_ip"]).encode()).hexdigest()[:16]
+    value = dict(identifiers=[(i.kind, i.value) for i in identifiers(data)],
+                 profile=selected_profile(data["tls"]["server"]))
+    return "cert-" + hashlib.sha256(json.dumps(value, sort_keys=True).encode()).hexdigest()[:16]
+
+
+def candidate_identity(data: dict, fingerprint: str) -> dict:
+    if data["tls"]["server"].get("mode") == "acme_ip":
+        return dict(environment=settings(data)["environment"], ip=str(data["server"]["public_ip"]), fingerprint=fingerprint)
+    return dict(environment=settings(data)["environment"],
+                identifiers=[dict(type=i.kind, value=i.value) for i in identifiers(data)],
+                profile=selected_profile(data["tls"]["server"]), fingerprint=fingerprint)
 
 
 def settings(data: dict) -> dict:
     value = data["tls"]["server"]["acme"]
     return dict(environment=value.get("environment", "production"), email=value.get("email"),
-                preferred_chain=value.get("preferred_chain", "ISRG Root X2"),
+                profile=selected_profile(data["tls"]["server"]),
+                preferred_chain=value.get("preferred_chain", "ISRG Root X2" if data["tls"]["server"].get("mode") == "acme_ip" else None),
                 renewal_enabled=value.get("renewal", {}).get("enabled", True),
                 interval_minutes=value.get("renewal", {}).get("interval_minutes", 60),
                 retain_state=value.get("cleanup", {}).get("retain_state", False))
 
 
 def validate(server: dict) -> None:
-    if set(server) != {"mode", "acme"}:
-        raise ValueError("acme_ip tls.server must contain only mode and acme")
+    legacy = server.get("mode") == "acme_ip"
+    if set(server) != ({"mode", "acme"} if legacy else {"mode", "identifiers", "acme"}):
+        raise ValueError("ACME certificate must contain mode, acme and (for mode acme) identifiers")
+    if not legacy:
+        addressing.identities(server["identifiers"])
     value = server["acme"]
     if not isinstance(value, dict) or set(value) - {"environment", "email", "agree_tos", "profile", "challenge", "preferred_chain", "renewal", "deploy", "cleanup"}:
         raise ValueError("unsupported tls.server.acme settings")
@@ -33,10 +74,11 @@ def validate(server: dict) -> None:
         raise ValueError("ACME environment must be production or staging")
     if value.get("agree_tos") is not True:
         raise ValueError("ACME requires explicit agree_tos: true")
-    if value.get("profile", "shortlived") != "shortlived" or value.get("challenge", "http-01") != "http-01":
-        raise ValueError("ACME IP requires shortlived and http-01")
-    preferred_chain = value.get("preferred_chain", "ISRG Root X2")
-    if not isinstance(preferred_chain, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9 ._-]{0,63}", preferred_chain):
+    selected_profile(server)
+    if (legacy and value.get("profile", "shortlived") != "shortlived") or value.get("challenge", "http-01") != "http-01":
+        raise ValueError("ACME requires http-01; legacy acme_ip requires shortlived")
+    preferred_chain = value.get("preferred_chain", "ISRG Root X2" if legacy else None)
+    if preferred_chain is not None and (not isinstance(preferred_chain, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9 ._-]{0,63}", preferred_chain)):
         raise ValueError("invalid ACME preferred_chain")
     email = value.get("email")
     if email is not None and (not isinstance(email, str) or not re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", email) or len(email) > 254):
@@ -63,8 +105,14 @@ def resources(p: dict) -> dict:
     if not identity:
         raise ValueError("ACME requires a named instance.id")
     root = Path("/var/lib/3proxy-acme/instances") / identity
-    return dict(root=root, client=root / "client", candidate=root / "candidate",
-                status=root / "status.json", registry=root / "owner.json",
+    scope = root
+    certificate_id = p.get("CERTIFICATE_ID")
+    if certificate_id is not None:
+        if not re.fullmatch(r"[a-z][a-z0-9-]{0,31}", certificate_id):
+            raise ValueError("invalid certificate id")
+        scope = root / "certificates" / certificate_id
+    return dict(root=root, client=root / "client", candidate=scope / "candidate",
+                status=scope / "status.json", registry=root / "owner.json",
                 unit_dir=Path(p["UNIT_FILE"]).parent,
                 prefix=p["SERVICE"] + "-acme")
 

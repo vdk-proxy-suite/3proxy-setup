@@ -25,7 +25,7 @@ elif [[ ! -d "$DATA_DIR" ]]; then
   install -d -m 755 "$DATA_DIR"
 fi
 prepare_managed_tls
-if [[ -d "$CONFIG_DIR/tls" ]]; then
+if [[ -f "$CONFIG_DIR/tls/server.key" ]]; then
   chown root:"$SERVICE_GROUP" "$CONFIG_DIR/tls" "$CONFIG_DIR/tls/server.key"
   chmod 750 "$CONFIG_DIR/tls"
   chmod 640 "$CONFIG_DIR/tls/server.key"
@@ -44,6 +44,9 @@ chown root:"$SERVICE_GROUP" "$tmp_cfg"
 chmod 640 "$tmp_cfg"
 chmod 644 "$tmp_unit"
 mv -f "$tmp_cfg" ${CONFIG_DIR}/3proxy.cfg
+if [[ -f "$INSTANCE_STATE/upstreams.pending.json" ]]; then
+  install -m 600 "$INSTANCE_STATE/upstreams.pending.json" "$INSTANCE_STATE/upstreams.json"
+fi
 python3 "$SETUP_ROOT/tools/instance.py" unit-intent --unit-file "$tmp_unit" "$@"
 mv -f "$tmp_unit" ${UNIT_FILE}
 

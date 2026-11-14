@@ -19,12 +19,26 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 
 import acme_config as policy
+import addressing
+import schema_v2
 import config as config_tool
 import instance
 import operation_lock
 import tls_material as tls
 
 HERE = Path(__file__).resolve().parent
+
+
+def owner_paths(p: dict) -> dict:
+    """A certificate selector is not part of the instance ownership identity."""
+    result = dict(p)
+    if "CERTIFICATE_ID" in result:
+        name = result.pop("CERTIFICATE_ID")
+        if not isinstance(name, str) or not re.fullmatch(r"[a-z][a-z0-9-]{0,31}", name):
+            raise ValueError("invalid certificate id")
+    # Keep every actual path and every unexpected key: read_manifest must still
+    # reject a mismatched instance, changed path, or injected ownership field.
+    return result
 
 
 def run(args, *, check=True, **kwargs):
@@ -50,7 +64,7 @@ def verify_tree(root: Path) -> None:
             expected = False
             if relative == "client/lib64":
                 expected = target == root / "client/lib"
-            match = re.fullmatch(r"(production|staging)/config/live/(ip-[a-f0-9]{16})/(cert|chain|fullchain|privkey)\.pem", relative)
+            match = re.fullmatch(r"(production|staging)/config/live/((?:ip|cert)-[a-f0-9]{16})/(cert|chain|fullchain|privkey)\.pem", relative)
             if match:
                 env, lineage, kind = match.groups()
                 parent = root / env / "config/archive" / lineage
@@ -112,7 +126,7 @@ def verify_owned(p: dict, manifest: dict) -> None:
 
 
 def register(p: dict, data: dict) -> dict:
-    manifest = instance.read_manifest(p)
+    manifest = instance.read_manifest(owner_paths(p))
     if manifest is None:
         raise ValueError("instance manifest required before ACME")
     verify_owned(p, manifest)
@@ -125,7 +139,12 @@ def register(p: dict, data: dict) -> dict:
     if not r["registry"].exists():
         instance.atomic_json(r["registry"], {"instance": p["INSTANCE_ID"], "token": manifest["token"]})
     r["root"].chmod(0o700)
-    manifest["acme"]["retain_state"] = policy.settings(data)["retain_state"]
+    retain = policy.settings(data)["retain_state"]
+    if p.get("CERTIFICATE_ID"):
+        # A later certificate must not erase an earlier retention request if
+        # preflight fails before the aggregate instance policy is installed.
+        retain = retain or manifest["acme"].get("retain_state", False)
+    manifest["acme"]["retain_state"] = retain
     save_manifest(p, manifest)
     return manifest
 
@@ -135,6 +154,16 @@ def event(p: dict, **values) -> None:
     old = json.loads(file.read_text()) if file.exists() else {}
     old.update(values)
     instance.atomic_json(file, old)
+
+
+def active_directory(p: dict) -> Path:
+    root = Path(p["CONFIG_DIR"]) / "tls"
+    name = p.get("CERTIFICATE_ID")
+    if name is not None:
+        if not re.fullmatch(r"[a-z][a-z0-9-]{0,31}", name):
+            raise ValueError("invalid certificate id")
+        return root / name
+    return root
 
 
 def bootstrap(p: dict) -> None:
@@ -174,7 +203,8 @@ def leaf_info(certificate: Path) -> dict:
     return dict(fingerprint=fingerprint(certificate),
                 not_after=ssl.cert_time_to_seconds(decoded["notAfter"]),
                 not_before=ssl.cert_time_to_seconds(decoded["notBefore"]),
-                ips=sorted(value for kind, value in decoded.get("subjectAltName", ()) if kind == "IP Address"))
+                ips=sorted(addressing.identity(value).value for kind, value in decoded.get("subjectAltName", ()) if kind == "IP Address"),
+                dns=sorted(addressing.identity(value).value for kind, value in decoded.get("subjectAltName", ()) if kind == "DNS"))
 
 
 def chain_root(certificate: Path) -> str:
@@ -203,19 +233,20 @@ def validate(data: dict, bundle: dict, minimum=86400) -> None:
     supplied.pop("trust.crt", None)
     if policy.settings(data)["environment"] == "staging":
         supplied["trust.crt"] = trust_file(data).read_bytes()
-    tls.validate_bundle(supplied, str(data["server"]["public_ip"]), minimum_seconds=minimum)
+    tls.validate_bundle(supplied, [i.value for i in policy.identifiers(data)], minimum_seconds=minimum,
+                        exact_sans=data["tls"]["server"].get("mode") == "acme")
     expected_chain = policy.settings(data)["preferred_chain"]
     with tempfile.TemporaryDirectory(prefix="3proxy-acme-bundle-") as temporary:
         served = Path(temporary) / "server.crt"
         served.write_bytes(bundle["server.crt"])
         actual_chain = chain_root(served)
-    if actual_chain != expected_chain:
+    if expected_chain is not None and actual_chain != expected_chain:
         raise ValueError(f"ACME selected chain {actual_chain!r}, expected {expected_chain!r}")
     with tempfile.TemporaryDirectory(prefix="3proxy-acme-leaf-") as temporary:
         leaf = Path(temporary)/"leaf.crt"
         leaf.write_bytes(bundle["server.crt"])
         info = leaf_info(leaf)
-        if info["not_after"] - info["not_before"] > 7*86400:
+        if policy.settings(data)["profile"] == "shortlived" and info["not_after"] - info["not_before"] > 7*86400:
             raise ValueError("ACME returned a non-shortlived certificate")
 
 
@@ -223,16 +254,19 @@ def certbot_args(p: dict, data: dict, *, first: bool) -> list[str]:
     settings = policy.settings(data)
     r = policy.resources(p)
     directory = r["root"]/settings["environment"]
-    lineage = "ip-" + hashlib.sha256(str(data["server"]["public_ip"]).encode()).hexdigest()[:16]
+    lineage = policy.lineage(data)
     args = [str(r["client"]/"bin/certbot"), "certonly" if first else "renew",
             "--non-interactive", "--agree-tos", "--config", str(r["root"]/"cli.ini"),
             "--config-dir", str(directory/"config"), "--work-dir", str(directory/"work"),
             "--logs-dir", str(directory/"logs"), "--server", policy.DIRECTORIES[settings["environment"]],
             "--cert-name", lineage, "--standalone", "--preferred-challenges", "http-01",
-            "--required-profile", "shortlived", "--no-reuse-key", "--no-directory-hooks"]
-    args += ["--preferred-chain", settings["preferred_chain"]]
+            "--required-profile", settings["profile"], "--no-reuse-key", "--no-directory-hooks"]
+    if settings["preferred_chain"] is not None:
+        args += ["--preferred-chain", settings["preferred_chain"]]
     if first:
-        args += ["--ip-address", str(data["server"]["public_ip"]), "--keep-until-expiring"]
+        for requested in policy.identifiers(data):
+            args += requested.acme_args()
+        args += ["--keep-until-expiring"]
         args += ["--email", settings["email"]] if settings["email"] else ["--register-unsafely-without-email"]
     else:
         args += ["--no-random-sleep-on-renew"]
@@ -243,7 +277,7 @@ def issuance(p: dict, data: dict) -> None:
     r = policy.resources(p)
     settings = policy.settings(data)
     directory = r["root"]/settings["environment"]
-    lineage = "ip-" + hashlib.sha256(str(data["server"]["public_ip"]).encode()).hexdigest()[:16]
+    lineage = policy.lineage(data)
     live = directory/"config/live"/lineage
     first = not (directory/"config/renewal"/(lineage+".conf")).exists()
     (r["root"]/"cli.ini").write_text("# Instance-owned Certbot configuration; policy supplied by controller.\n")
@@ -266,26 +300,49 @@ def issuance(p: dict, data: dict) -> None:
     before = fingerprint(candidate/"server.crt") if (candidate/"server.crt").exists() else None
     tls.replace_directory(candidate, bundle)
     info = leaf_info(candidate/"server.crt")
-    instance.atomic_json(candidate/"identity.json", dict(environment=settings["environment"], ip=str(data["server"]["public_ip"]), fingerprint=info["fingerprint"]))
+    instance.atomic_json(candidate/"identity.json", policy.candidate_identity(data, info["fingerprint"]))
     event(p, last_check=time.time(), last_error=None, candidate=info,
           **({"last_issued": time.time()} if before != info["fingerprint"] else {}))
+
+
+def test_renewal(p: dict, data: dict) -> None:
+    """Exercise Certbot renewal validation without installing or staging a leaf."""
+    r = policy.resources(p)
+    path = r["root"] / policy.settings(data)["environment"] / "config/renewal" / (policy.lineage(data) + ".conf")
+    if not path.is_file():
+        raise ValueError("initial issuance is required before test-renewal")
+    before = fingerprint(active_directory(p) / "server.crt")
+    with operation_lock.acquire(p["INSTANCE_ID"], http=True):
+        result = run([*certbot_args(p, data, first=False), "--dry-run"], check=False,
+                     env=dict(os.environ, REQUESTS_CA_BUNDLE=tls.SYSTEM_CA))
+    if result.returncode:
+        raise ValueError("Certbot test-renewal failed: " + result.stderr[-1800:] + result.stdout[-1800:])
+    if fingerprint(active_directory(p) / "server.crt") != before:
+        raise ValueError("active certificate changed during test-renewal")
 
 
 def check_identity(p: dict, data: dict) -> None:
     r = policy.resources(p)
     meta = json.loads((r["candidate"]/"identity.json").read_text())
-    if meta != dict(environment=policy.settings(data)["environment"], ip=str(data["server"]["public_ip"]),
-                    fingerprint=fingerprint(r["candidate"]/"server.crt")):
+    if meta != policy.candidate_identity(data, fingerprint(r["candidate"]/"server.crt")):
         raise ValueError("candidate identity mismatch")
 
 
 def active_matches(p: dict, data: dict) -> bool:
-    directory = Path(p["CONFIG_DIR"])/"tls"
+    directory = active_directory(p)
     try:
         marker = (directory/"mode").read_text().strip()
+        info = leaf_info(directory/"server.crt")
+        actual = {addressing.Identity("ip", value) for value in info["ips"]}
+        actual.update(addressing.Identity("dns", value) for value in info["dns"])
+        chain = policy.settings(data)["preferred_chain"]
+        if data["tls"]["server"].get("mode") == "acme":
+            metadata = directory / "identity.json"
+            if not metadata.exists() or json.loads(metadata.read_text()) != policy.candidate_identity(data, info["fingerprint"]):
+                return False
         return (marker == "acme:"+policy.settings(data)["environment"]
-                and leaf_info(directory/"server.crt")["ips"] == [str(data["server"]["public_ip"])]
-                and chain_root(directory/"server.crt") == policy.settings(data)["preferred_chain"])
+                and actual == set(policy.identifiers(data))
+                and (chain is None or chain_root(directory/"server.crt") == chain))
     except (OSError, ValueError, ssl.SSLError):
         return False
 
@@ -293,7 +350,7 @@ def active_matches(p: dict, data: dict) -> bool:
 def preflight(p: dict, data: dict) -> None:
     if not policy.enabled(data):
         return
-    active = Path(p["CONFIG_DIR"])/"tls"
+    active = active_directory(p)
     if policy.settings(data)["environment"] == "staging" and (active/"server.crt").exists() and not active_matches(p, data):
         raise ValueError("staging cannot replace an existing non-staging listener; use a separate instance")
     register(p, data)
@@ -310,15 +367,17 @@ def install_candidate(p: dict, data: dict) -> None:
     check_identity(p, data)
     bundle = read_bundle(r["candidate"])
     validate(data, bundle)
-    destination = Path(p["CONFIG_DIR"])/"tls"
+    destination = active_directory(p)
     tls.replace_directory(destination, bundle)
     (destination/"mode").write_text("acme:"+policy.settings(data)["environment"]+"\n")
+    if data["tls"]["server"].get("mode") == "acme":
+        instance.atomic_json(destination / "identity.json", policy.candidate_identity(data, fingerprint(destination / "server.crt")))
     active_permissions(p)
 
 
 def active_permissions(p: dict) -> None:
     import grp
-    destination = Path(p["CONFIG_DIR"])/"tls"
+    destination = active_directory(p)
     gid = grp.getgrnam(p["SERVICE_GROUP"]).gr_gid
     os.chown(destination, 0, gid); destination.chmod(0o750)
     os.chown(destination/"server.key", 0, gid); (destination/"server.key").chmod(0o640)
@@ -329,7 +388,7 @@ def active_permissions(p: dict) -> None:
 def setup_install(p: dict, data: dict) -> None:
     if active_matches(p, data):
         # A manual reconfigure must not apply a queued renewal outside the daily window.
-        validate(data, read_bundle(Path(p["CONFIG_DIR"])/"tls"), minimum=0)
+        validate(data, read_bundle(active_directory(p)), minimum=0)
         return
     install_candidate(p, data)
 
@@ -346,8 +405,8 @@ def rendered_units(p: dict, data: dict) -> dict[str, str]:
     return output
 
 
-def configure(p: dict, data: dict) -> None:
-    manifest = instance.read_manifest(p)
+def configure(p: dict, data: dict, *, verify_served: bool = True) -> None:
+    manifest = instance.read_manifest(owner_paths(p))
     if not p["INSTANCE_ID"] or not manifest or not manifest.get("acme"):
         return
     verify_owned(p, manifest)
@@ -380,7 +439,9 @@ def configure(p: dict, data: dict) -> None:
             run(["systemctl", "enable", name]); run(["systemctl", "restart", name])
         else:
             run(["systemctl", "disable", "--now", name])
-    actual = served(p, data, fingerprint(Path(p["CONFIG_DIR"])/"tls/server.crt"))
+    if not verify_served:
+        return
+    actual = served(p, data, fingerprint(active_directory(p)/"server.crt"))
     old = json.loads(r["status"].read_text()) if r["status"].exists() else {}
     if old.get("served", [{}])[0].get("fingerprint") != actual[0]["fingerprint"]:
         event(p, last_deployed=time.time(), served=actual, last_deploy_error=None)
@@ -395,11 +456,13 @@ def served(p: dict, data: dict, expected: str | None = None) -> list[dict]:
         host = config_tool.listener_ip(data, listener)
         if host in ("0.0.0.0", "::"): host = "127.0.0.1" if host == "0.0.0.0" else "::1"
         with socket.create_connection((host, listener["port"]), timeout=5) as raw:
-            with context.wrap_socket(raw, server_hostname=str(data["server"]["public_ip"])) as connection:
+            tls_name = addressing.identity(listener.get("endpoint", {}).get("host", str(data["server"]["public_ip"]))).value
+            with context.wrap_socket(raw, server_hostname=tls_name) as connection:
                 sha = hashlib.sha256(connection.getpeercert(binary_form=True)).hexdigest()
                 expiry = ssl.cert_time_to_seconds(connection.getpeercert()["notAfter"])
                 if expected is not None and sha != expected: raise ValueError("listener still serves a different certificate")
-                results.append(dict(listener=listener["id"], fingerprint=sha, not_after=expiry))
+                results.append(dict(listener=listener["id"], fingerprint=sha, not_after=expiry,
+                                    connect_address=host, address_family=addressing.identity(host).family, tls_identity=tls_name))
     if not results: raise ValueError("ACME has no HTTPS listeners")
     return results
 
@@ -478,7 +541,7 @@ def status(p: dict, data: dict) -> dict:
         if result["state"] == "ok": result["state"] = "warning"
     if result.get("last_check", 0) < time.time() - (policy.settings(data)["interval_minutes"]*120+300):
         if result["state"] == "ok": result["state"] = "warning"
-    active_sha = fingerprint(Path(p["CONFIG_DIR"])/"tls/server.crt")
+    active_sha = fingerprint(active_directory(p)/"server.crt")
     if any(item["fingerprint"] != active_sha for item in result["served"]): result["state"] = "critical"
     return result
 
@@ -504,7 +567,7 @@ def cleanup(p: dict, manifest: dict, *, execute: bool, purge_logs=False) -> None
                     logs.mkdir(mode=0o700, parents=True, exist_ok=True)
                     shutil.copytree(source, logs/environment, dirs_exist_ok=True)
         if manifest["acme"].get("retain_state"):
-            for name in ("client", "candidate", "deploy-rollback"):
+            for name in ("client", "candidate", "deploy-rollback", "certificates", "deploy-rollback-v2"):
                 target = r["root"]/name
                 if target.exists(): shutil.rmtree(target)
         else:
@@ -513,7 +576,7 @@ def cleanup(p: dict, manifest: dict, *, execute: bool, purge_logs=False) -> None
 
 
 def backup(p: dict, directory: Path) -> None:
-    manifest = instance.read_manifest(p)
+    manifest = instance.read_manifest(owner_paths(p))
     if not p["INSTANCE_ID"] or not manifest or not manifest.get("acme"): return
     verify_owned(p, manifest)
     r = policy.resources(p)
@@ -526,7 +589,7 @@ def backup(p: dict, directory: Path) -> None:
             shutil.copyfile(source, destination/name)
             state[name] = dict(enabled=run(["systemctl","is-enabled","--quiet",name],check=False).returncode == 0,
                                active=run(["systemctl","is-active","--quiet",name],check=False).returncode == 0)
-    for name in ("status.json", "candidate"):
+    for name in ("status.json", "candidate", "certificates"):
         source = r["root"]/name
         if source.is_dir(): shutil.copytree(source, destination/name)
         elif source.exists(): shutil.copyfile(source, destination/name)
@@ -534,7 +597,7 @@ def backup(p: dict, directory: Path) -> None:
 
 
 def rollback(p: dict, directory: Path) -> None:
-    manifest = instance.read_manifest(p)
+    manifest = instance.read_manifest(owner_paths(p))
     if not p["INSTANCE_ID"] or not manifest or not manifest.get("acme"): return
     verify_owned(p, manifest)
     r = policy.resources(p)
@@ -549,7 +612,7 @@ def rollback(p: dict, directory: Path) -> None:
                 raise ValueError("backup ACME unit ownership mismatch")
             shutil.copyfile(source,target);target.chmod(0o644)
         elif target.exists(): target.unlink()
-    for name in ("status.json", "candidate"):
+    for name in ("status.json", "candidate", "certificates"):
         target=r["root"]/name
         if target.is_dir(): shutil.rmtree(target)
         elif target.exists(): target.unlink()
@@ -566,7 +629,7 @@ def rollback(p: dict, directory: Path) -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("action", choices=("preflight", "install", "configure", "renew", "deploy", "status", "backup", "rollback"))
+    parser.add_argument("action", choices=("preflight", "install", "configure", "renew", "test-renewal", "deploy", "status", "backup", "rollback"))
     parser.add_argument("--config", type=Path)
     parser.add_argument("--instance")
     parser.add_argument("--directory", type=Path)
@@ -584,8 +647,8 @@ def main() -> int:
         data = config_tool.load_config(path);config_tool.validate(data)
         if (data.get("instance", {}).get("id") or "") != p["INSTANCE_ID"]:
             raise ValueError("configuration identity changed while waiting for instance lock")
-        if not policy.enabled(data) and args.action not in ("configure", "backup", "rollback"): return 0
-        manifest = instance.read_manifest(p)
+        if not schema_v2.enabled(data) and not policy.enabled(data) and args.action not in ("configure", "backup", "rollback"): return 0
+        manifest = instance.read_manifest(owner_paths(p))
         if not manifest or manifest.get("status") == "removed": raise ValueError("no active instance ownership")
         instance.checked_accounts(p, manifest);instance.verify_unit(p, manifest)
         try:
@@ -594,9 +657,27 @@ def main() -> int:
                     raise ValueError("invalid instance backup directory")
                 instance.guard(args.directory)
                 (backup if args.action == "backup" else rollback)(p, args.directory)
+            elif schema_v2.enabled(data):
+                import tls_v2
+                if args.action == "preflight": tls_v2.preflight(p, data)
+                elif args.action == "install": tls_v2.install(p, data)
+                elif args.action == "configure": tls_v2.configure(p, data)
+                elif args.action == "renew": tls_v2.renew(p, data)
+                elif args.action == "test-renewal":
+                    for _, scoped, view in tls_v2.contexts(p, data, only_acme=True):
+                        test_renewal(scoped, view)
+                    print("ACME test-renewal passed; active certificates unchanged")
+                elif args.action == "deploy": print(tls_v2.deploy(p, data))
+                else:
+                    report = tls_v2.status(p, data)
+                    print(json.dumps(report))
+                    return 0 if report["state"] == "ok" else 1
             elif args.action == "preflight": preflight(p, data)
             elif args.action == "install": setup_install(p, data)
             elif args.action == "configure": configure(p, data)
+            elif args.action == "test-renewal":
+                test_renewal(p, data)
+                print("ACME test-renewal passed; active certificate unchanged")
             elif args.action == "renew":
                 if policy.settings(data)["renewal_enabled"]:
                     issuance(p, data)

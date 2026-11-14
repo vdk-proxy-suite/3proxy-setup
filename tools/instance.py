@@ -125,9 +125,17 @@ def checked_accounts(p: dict, manifest: dict) -> None:
 
 
 def check_ports(p: dict, config: Path) -> None:
+    import addressing
+    import schema_v2
     data = yaml.safe_load(config.read_text())
-    requested = {(str(item.get("listen_ip", data["server"]["listen_ip"])), item["port"])
-                 for item in data["listeners"]}
+    def address(owner, item):
+        return str(item.get("listen_ip", owner["server"].get("listen_ip", "")))
+    requested = {(address(data, item), item["port"])
+                 for item in schema_v2.expanded_listeners(data)}
+    if schema_v2.enabled(data) and any(host == "::" for host, _ in requested):
+        with socket.socket(socket.AF_INET6, socket.SOCK_STREAM) as probe:
+            if probe.getsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY):
+                raise ValueError("dual-stack :: bind requires net.ipv6.bindv6only=0; use separate concrete IPv4/IPv6 binds")
     state_parent = Path(p["INSTANCE_STATE"]).parent
     for other in state_parent.glob("*/manifest.json"):
         guard(other)
@@ -138,10 +146,10 @@ def check_ports(p: dict, config: Path) -> None:
         if not other_config.exists():
             raise ValueError(f"cannot verify ports of incomplete neighboring instance: {other.parent.name}")
         other_data = yaml.safe_load(other_config.read_text())
-        for listener in other_data["listeners"]:
-            address = str(listener.get("listen_ip", other_data["server"]["listen_ip"]))
+        for listener in schema_v2.expanded_listeners(other_data):
+            other_address = address(other_data, listener)
             for host, port in requested:
-                if port == listener["port"] and (host == address or host in ("0.0.0.0", "::") or address in ("0.0.0.0", "::")):
+                if port == listener["port"] and addressing.overlaps(host, other_address):
                     raise ValueError(f"listener conflicts with instance {other.parent.name}: port {port}")
     active = subprocess.run(["systemctl", "is-active", "--quiet", p["SERVICE"]],
                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
@@ -252,9 +260,23 @@ WantedBy=multi-user.target
     from config import load_config, validate
     normalized_config = load_config(config)
     validate(normalized_config)
+    upstream_snapshot = None
+    if normalized_config.get("schema_version") == 2:
+        import upstream_resolution
+        upstream_file = Path(p["INSTANCE_STATE"]) / "upstreams.pending.json"
+        requested_file = Path(p["INSTANCE_STATE"]) / "requested.yaml"
+        if config.resolve() == requested_file.resolve() and upstream_file.exists():
+            addresses = upstream_resolution.load(upstream_file, normalized_config)
+            upstream_snapshot = dict(schema=1, policy_key=upstream_resolution.policy_key(normalized_config), addresses=addresses)
+        else:
+            upstream_snapshot = upstream_resolution.create(normalized_config)
     from tls_material import collect as collect_server_tls, stage as stage_server_tls
     from config import tls_server_mode
     server_bundle = None
+    named_bundles = None
+    if normalized_config.get("schema_version") == 2:
+        from tls_v2 import collect_external
+        named_bundles = collect_external(p, normalized_config)
     if tls_server_mode(normalized_config) == "external":
         server_bundle = collect_server_tls(normalized_config, Path(p["INSTANCE_STATE"]) / "pending-server-tls")
     elif tls_server_mode(normalized_config) == "managed" and normalized_config.get("tls", {}).get("server") is not None and (Path(p["CONFIG_DIR"]) / "tls" / "mode").exists() and normalized_config.get("tls", {}).get("server", {}).get("mode") != "managed":
@@ -289,6 +311,11 @@ WantedBy=multi-user.target
         pending_ca.chmod(0o600)
     if server_bundle is not None:
         stage_server_tls(normalized_config, p, server_bundle)
+    if named_bundles is not None:
+        from tls_v2 import stage_external
+        stage_external(p, normalized_config, named_bundles)
+    if upstream_snapshot is not None:
+        atomic_json(Path(p["INSTANCE_STATE"]) / "upstreams.pending.json", upstream_snapshot)
     snapshot.write_text(yaml.safe_dump(normalized_config, sort_keys=False), encoding="utf-8")
     snapshot.chmod(0o600)
     marker = source / ".3proxy-instance.json"
@@ -447,7 +474,8 @@ def cleanup(p: dict, args: argparse.Namespace) -> None:
             # Never delete /var/log/3proxy/instances or unrelated files.
             removable.extend(str(f) for f in Path(p["LOG_DIR"]).glob("3proxy.log*") if f.is_file())
             removable.append(str(Path(p["LOG_DIR"]) / "healthchecks"))
-    for file in ("requested.yaml", "build-manifest.json", "backup.state", "monitor-v1-migrated", "manifest.new", "pending-client-ca.crt", "pending-server-tls"):
+    for file in ("requested.yaml", "build-manifest.json", "backup.state", "monitor-v1-migrated", "manifest.new",
+                 "pending-client-ca.crt", "pending-server-tls", "pending-certificates", "upstreams.json", "upstreams.pending.json"):
         removable.append(str(Path(p["INSTANCE_STATE"]) / file))
     # Validate every path before stopping the service or deleting anything.
     for item in removable:

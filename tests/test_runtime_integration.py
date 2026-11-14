@@ -15,6 +15,7 @@ import time
 import unittest
 from dataclasses import dataclass
 from pathlib import Path
+from unittest import mock
 from typing import Iterator
 
 
@@ -69,15 +70,15 @@ def _unused_loopback_port() -> int:
 
 
 class _SentinelTarget:
-    def __init__(self, port_last_digit: int | None = None) -> None:
-        self._listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    def __init__(self, port_last_digit: int | None = None, *, bind_host: str = "127.0.0.1") -> None:
+        self._listener = socket.socket(socket.AF_INET6 if ":" in bind_host else socket.AF_INET, socket.SOCK_STREAM)
         self._listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         if port_last_digit is None:
-            self._listener.bind(("127.0.0.1", 0))
+            self._listener.bind((bind_host, 0))
         else:
             for candidate in range(24000 + port_last_digit, 65000, 10):
                 try:
-                    self._listener.bind(("127.0.0.1", candidate))
+                    self._listener.bind((bind_host, candidate))
                     break
                 except OSError:
                     continue
@@ -151,10 +152,12 @@ class _TlsConnectParent:
         allowed_target: tuple[str, int],
         expected_username: str | None = DUMMY_UPSTREAM_USER,
         expected_password: str | None = DUMMY_UPSTREAM_PASSWORD,
+        *,
+        bind_host: str = "127.0.0.1",
     ) -> None:
-        self._listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self._listener = socket.socket(socket.AF_INET6 if ":" in bind_host else socket.AF_INET, socket.SOCK_STREAM)
         self._listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self._listener.bind(("127.0.0.1", 0))
+        self._listener.bind((bind_host, 0))
         self._listener.listen()
         self._listener.settimeout(0.1)
         self.port = int(self._listener.getsockname()[1])
@@ -325,10 +328,10 @@ class _TlsConnectParent:
 
     @staticmethod
     def _connect_target(request_line: str) -> tuple[str, int] | None:
-        match = re.fullmatch(r"CONNECT ([^: ]+):(\d+) HTTP/\d\.\d", request_line)
+        match = re.fullmatch(r"CONNECT (\[[^\]]+\]|[^: ]+):(\d+) HTTP/\d\.\d", request_line)
         if match is None:
             return None
-        return match.group(1), int(match.group(2))
+        return match.group(1).strip("[]"), int(match.group(2))
 
 
 @dataclass(frozen=True)
@@ -458,6 +461,135 @@ class GeneratedHttpsBridgeRuntimeTests(unittest.TestCase):
             "-extfile", str(leaf_config), "-extensions", "server_ext", "-out", str(leaf_certificate),
         )
         return ca_certificate, leaf_certificate, leaf_key
+
+    def test_schema2_ipv6_https_parent_keeps_sni_and_fails_closed(self):
+        from test_schema_v2 import profile
+        scenarios = [("valid", True, True, False, GOOD_PARENT_NAME, DUMMY_UPSTREAM_PASSWORD),
+                     ("no-auth", True, False, False, GOOD_PARENT_NAME, DUMMY_UPSTREAM_PASSWORD),
+                     ("bad-ca", False, True, True, GOOD_PARENT_NAME, DUMMY_UPSTREAM_PASSWORD),
+                     ("bad-name", False, True, False, WRONG_PARENT_NAME, DUMMY_UPSTREAM_PASSWORD),
+                     ("bad-auth", False, True, False, GOOD_PARENT_NAME, "incorrect-parent-password")]
+        cases = [(label + "-" + family, success, auth, wrong_ca, server_name, password, host)
+                 for label, success, auth, wrong_ca, server_name, password in scenarios
+                 for family, host in [("ipv4", "127.0.0.1"), ("ipv6", "::1")]]
+        for label, success, auth, wrong_ca, server_name, parent_password, target_host in cases:
+            with self.subTest(scenario=label), _SentinelTarget(bind_host=target_host) as target:
+                with _TlsConnectParent(self.server_certificate, self.server_key, (target_host, target.port),
+                        DUMMY_UPSTREAM_USER if auth else None, DUMMY_UPSTREAM_PASSWORD if auth else None,
+                        bind_host="::1") as parent:
+                    data = profile()
+                    data["local_auth"] = dict(username=DUMMY_LOCAL_USER, password=DUMMY_LOCAL_PASSWORD)
+                    data["tls"] = dict(client_ca_file=str(self.untrusted_ca_certificate if wrong_ca else self.ca_certificate))
+                    data["upstreams"] = dict(https_primary=dict(type="https", host="::1", port=parent.port,
+                        tls_server_name=server_name, resolve_family="ipv6", capabilities=["tcp"]))
+                    if auth:
+                        data["upstreams"]["https_primary"].update(username=DUMMY_UPSTREAM_USER, password=parent_password)
+                    port = _unused_loopback_port()
+                    listener = data["listeners"][0]
+                    listener.update(protocol="http", port=port, parent="https_primary")
+                    listener["outbound"]["family"] = "prefer_ipv4"
+                    listener.pop("tls_certificate")
+                    data["probes"]["egress"]["https_primary"] = data["probes"]["egress"].pop("direct")
+                    data["probes"]["egress"]["https_primary"]["ipv6"] = {"expected_ips": ["2001:db8::1"]}
+                    self.config_tool.validate(data)
+                    directory = self.temporary_root / ("ipv6-parent-" + label); directory.mkdir()
+                    p = self.config_tool.paths("dev"); p.update(LOG_DIR=str(directory), CONFIG_DIR=str(directory))
+                    with mock.patch.object(self.config_tool, "paths", return_value=p):
+                        rendered = self.config_tool.render_3proxy(data, {"https_primary": "::1"})
+                    path = directory / "3proxy.cfg"
+                    path.write_text(rendered.replace("maxconn 1000", "maxconn 1000\nparentretries 1"))
+                    stdout_path = directory / "stdout.log"
+                    with stdout_path.open("wb") as output:
+                        process = subprocess.Popen([str(self.binary), str(path)], stdout=output, stderr=output)
+                        try:
+                            self._wait_for_listener(_RunningProxy(process, stdout_path, path), port)
+                            result = self._proxy_connect(port, target.port, (DUMMY_LOCAL_USER, DUMMY_LOCAL_PASSWORD), b"ipv6-parent-test", target_host=target_host)
+                            self.assertTrue(parent.wait_for_attempt())
+                            if success:
+                                self.assertEqual(result.status, 200)
+                                self.assertEqual(result.tunneled, SENTINEL_PREFIX + b"ipv6-parent-test")
+                                self.assertEqual(parent.connect_targets, [(target_host, target.port)])
+                            else:
+                                self.assertNotEqual(result.status, 200)
+                                self.assertEqual(target.hit_count, 0, "parent failure bypassed directly to target")
+                            self.assertEqual(parent.plaintext_requests, [])
+                            self.assertTrue(all(prefix.startswith(b"\x16\x03") for prefix in parent.raw_prefixes))
+                            self.assertTrue(parent.sni_names)
+                            self.assertTrue(all(name == server_name for name in parent.sni_names))
+                        finally:
+                            process.terminate()
+                            try: process.wait(timeout=5)
+                            except subprocess.TimeoutExpired:
+                                process.kill(); process.wait(timeout=3)
+
+    def test_schema2_ipv6_socks_and_http_parents_route_both_target_families(self):
+        from test_schema_v2 import profile
+        for protocol in ("socks5", "http"):
+            for auth_mode in ("valid", "none", "wrong"):
+                for target_host in ("127.0.0.1", "::1"):
+                    label = f"native-parent-{protocol}-{auth_mode}-{'v6' if ':' in target_host else 'v4'}"
+                    with self.subTest(scenario=label), _SentinelTarget(bind_host=target_host) as target:
+                        directory = self.temporary_root / label; directory.mkdir()
+                        with socket.socket(socket.AF_INET6, socket.SOCK_STREAM) as reserved:
+                            reserved.bind(("::1", 0)); parent_port = reserved.getsockname()[1]
+                        command = "socks" if protocol == "socks5" else "proxy"
+                        parent_config = directory / "parent.cfg"
+                        auth = ("auth iponly\nallow * ::1/128\ndeny *\n" if auth_mode == "none" else
+                                f"users {DUMMY_UPSTREAM_USER}:CL:{DUMMY_UPSTREAM_PASSWORD}\nauth strong\nallow {DUMMY_UPSTREAM_USER}\n")
+                        parent_config.write_text(auth + f"{command} -i::1 -p{parent_port} -46\n")
+                        data = profile(); data.pop("tls")
+                        data["local_auth"] = dict(username=DUMMY_LOCAL_USER, password=DUMMY_LOCAL_PASSWORD)
+                        name = "socks_primary" if protocol == "socks5" else "http_primary"
+                        data["upstreams"] = {name: dict(type=protocol, host="::1", port=parent_port, resolve_family="ipv6", capabilities=["tcp"])}
+                        if auth_mode != "none":
+                            data["upstreams"][name].update(username=DUMMY_UPSTREAM_USER,
+                                password=DUMMY_UPSTREAM_PASSWORD if auth_mode == "valid" else "wrong-parent-password")
+                        port = _unused_loopback_port()
+                        listener = data["listeners"][0]
+                        listener.update(protocol="http", port=port, parent=name)
+                        listener.pop("tls_certificate")
+                        listener["outbound"]["family"] = "prefer_ipv4"
+                        egress = data["probes"]["egress"].pop("direct")
+                        egress["ipv6"] = dict(expected_ips=["2001:db8::1"])
+                        data["probes"]["egress"][name] = egress
+                        self.config_tool.validate(data)
+                        paths = self.config_tool.paths("dev"); paths.update(LOG_DIR=str(directory), CONFIG_DIR=str(directory))
+                        with mock.patch.object(self.config_tool, "paths", return_value=paths):
+                            rendered = self.config_tool.render_3proxy(data, {name: "::1"})
+                        child_config = directory / "child.cfg"
+                        child_config.write_text(rendered.replace("maxconn 1000", "maxconn 1000\nparentretries 1"))
+                        output_path = directory / "stdout.log"
+                        processes = []
+                        with output_path.open("wb") as output:
+                            try:
+                                parent = subprocess.Popen([str(self.binary), str(parent_config)], stdout=output, stderr=output)
+                                processes.append(parent)
+                                deadline = time.monotonic() + 5
+                                while True:
+                                    try:
+                                        with socket.create_connection(("::1", parent_port), timeout=.2): pass
+                                        break
+                                    except OSError:
+                                        if time.monotonic() >= deadline or parent.poll() is not None:
+                                            self.fail("native IPv6 parent did not start")
+                                        time.sleep(.03)
+                                child = subprocess.Popen([str(self.binary), str(child_config)], stdout=output, stderr=output)
+                                processes.append(child)
+                                self._wait_for_listener(_RunningProxy(child, output_path, child_config), port)
+                                result = self._proxy_connect(port, target.port, (DUMMY_LOCAL_USER, DUMMY_LOCAL_PASSWORD),
+                                                             b"native-parent-ipv6", target_host=target_host)
+                                if auth_mode == "wrong":
+                                    self.assertNotEqual(result.status, 200)
+                                    self.assertEqual(target.hit_count, 0)
+                                else:
+                                    self.assertEqual(result.status, 200, output_path.read_text())
+                                    self.assertEqual(result.tunneled, SENTINEL_PREFIX + b"native-parent-ipv6")
+                            finally:
+                                for process in reversed(processes):
+                                    process.terminate()
+                                    try: process.wait(timeout=5)
+                                    except subprocess.TimeoutExpired:
+                                        process.kill(); process.wait(timeout=3)
 
     def _render_config(
         self,
@@ -630,13 +762,13 @@ class GeneratedHttpsBridgeRuntimeTests(unittest.TestCase):
         target_port: int,
         credentials: tuple[str, str] | None,
         payload: bytes,
+        *,
+        target_host: str = "127.0.0.1",
     ) -> _ProxyResult:
         with socket.create_connection(("127.0.0.1", proxy_port), timeout=3) as client:
             client.settimeout(5)
-            lines = [
-                f"CONNECT 127.0.0.1:{target_port} HTTP/1.1",
-                f"Host: 127.0.0.1:{target_port}",
-            ]
+            authority = f"[{target_host}]:{target_port}" if ":" in target_host else f"{target_host}:{target_port}"
+            lines = [f"CONNECT {authority} HTTP/1.1", f"Host: {authority}"]
             if credentials is not None:
                 lines.append(f"Proxy-Authorization: {_basic_value(*credentials)}")
             client.sendall(("\r\n".join(lines) + "\r\n\r\n").encode("ascii"))

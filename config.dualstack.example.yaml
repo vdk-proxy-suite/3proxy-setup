@@ -1,0 +1,91 @@
+# Fictional deployment identities. Copy to a private config.<ssh-alias>.yaml.
+# This profile requires working IPv4 and IPv6 on the server and in DNS.
+schema_version: 2
+instance:
+  id: main-dev
+install:
+  version: "1.0.3"
+  source_url: "https://github.com/3proxy/3proxy/archive/refs/tags/1.0.3.tar.gz"
+  sha256: "464553674be2b6d4f36c007604fb547df7841a8277f8282a3e3cda88134e0708"
+server:
+  manage_ufw: false
+logging:
+  format: monitor_v1
+  rotation: daily
+  keep_files: 14
+  compress: true
+access:
+  mode: strong
+local_auth:
+  username: CHANGE_ME_USER
+  password: CHANGE_ME_PASSWORD
+upstreams: {}
+listeners:
+  - id: socks_direct
+    protocol: socks5
+    port: 31080
+    bind: ["::"]
+    accept_families: [ipv4, ipv6]
+    endpoint:
+      host: proxy.example.com
+      families: [ipv4, ipv6]
+    parent: direct
+    outbound:
+      family: prefer_ipv4
+    capabilities: [tcp]
+  - id: http_direct
+    protocol: http
+    port: 38080
+    bind: ["::"]
+    accept_families: [ipv4, ipv6]
+    endpoint:
+      host: proxy.example.com
+      families: [ipv4, ipv6]
+    parent: direct
+    outbound:
+      family: prefer_ipv4
+    capabilities: [tcp]
+  - id: https_direct
+    protocol: https
+    port: 38443
+    bind: ["::"]
+    accept_families: [ipv4, ipv6]
+    endpoint:
+      host: proxy.example.com
+      families: [ipv4, ipv6]
+    tls_certificate: public-dns
+    parent: direct
+    outbound:
+      family: prefer_ipv4
+    capabilities: [tcp]
+tls:
+  certificates:
+    public-dns:
+      mode: acme
+      identifiers: [proxy.example.com]
+      acme:
+        environment: staging
+        agree_tos: true
+        email: admin@example.com
+        profile: auto
+        challenge: http-01
+        renewal:
+          enabled: true
+          interval_minutes: 60
+        cleanup:
+          retain_state: false
+  deploy:
+    time: "05:00"
+    timezone: Europe/Moscow
+probes:
+  timeout_seconds: 8
+  egress:
+    direct:
+      ipv4:
+        http_host: api.ipify.org
+        http_port: 80
+        expected_ips: ["203.0.113.10"]
+      ipv6:
+        http_host: api6.ipify.org
+        http_port: 80
+        expected_ips: ["2001:db8::10"]

@@ -11,6 +11,8 @@ from pathlib import Path
 from typing import Any
 
 import yaml
+import addressing
+import schema_v2
 
 from instance import identity, paths
 
@@ -45,7 +47,10 @@ def load_config(path: Path) -> dict[str, Any]:
         if not supplied.is_absolute() and not tls["client_ca_file"].startswith("/") :
             tls["client_ca_file"] = (path.resolve().parent / supplied).resolve().as_posix()
     server = tls.get("server") if isinstance(tls, dict) else None
-    if isinstance(server, dict):
+    servers = [server] if isinstance(server, dict) else []
+    if isinstance(tls, dict) and isinstance(tls.get("certificates"), dict):
+        servers.extend(value for value in tls["certificates"].values() if isinstance(value, dict))
+    for server in servers:
         for key in ("fullchain_file", "private_key_file", "ca_file"):
             value = server.get(key)
             if isinstance(value, str) and value and not value.startswith("/") and not Path(value).is_absolute():
@@ -103,6 +108,8 @@ def tls_server_config(data: dict[str, Any]) -> dict[str, Any] | None:
 
 
 def tls_server_mode(data: dict[str, Any]) -> str:
+    if schema_v2.enabled(data):
+        return "named"
     return (tls_server_config(data) or {}).get("mode", "managed")
 
 
@@ -114,7 +121,7 @@ def server_ca_file(data: dict[str, Any]) -> str:
 
 def validate_tls_server(server: dict[str, Any]) -> None:
     mode = server.get("mode", "managed")
-    if mode == "acme_ip":
+    if mode in {"acme_ip", "acme"}:
         from acme_config import validate as validate_acme
         validate_acme(server)
         return
@@ -184,6 +191,12 @@ def has_https_listener(data: dict[str, Any]) -> bool:
 
 
 def listener_ip(data: dict[str, Any], listener: dict[str, Any]) -> str:
+    if schema_v2.enabled(data):
+        if "listen_ip" in listener:
+            return listener["listen_ip"]
+        if len(listener["bind"]) != 1:
+            raise ValueError("listener has multiple binds; expand it before requesting one IP")
+        return addressing.literal(listener["bind"][0])
     return str(listener.get("listen_ip", data["server"]["listen_ip"]))
 
 
@@ -193,7 +206,7 @@ def effective_listener_access(data: dict[str, Any], listener: dict[str, Any]) ->
     return dict(data.get("access", {}))
 
 
-def validate_access(access: Any, name: str) -> str:
+def validate_access(access: Any, name: str, *, ipv6: bool = False) -> str:
     if not isinstance(access, dict):
         raise ValueError(f"{name} must be a mapping")
     mode = access.get("mode", "strong")
@@ -205,8 +218,8 @@ def validate_access(access: Any, name: str) -> str:
     if mode == "iponly" and not allowed_client_cidrs:
         raise ValueError(f"iponly access requires at least one allowed client CIDR ({name})")
     for index, value in enumerate(allowed_client_cidrs):
-        network = ipaddress.ip_network(str(value), strict=False)
-        if network.version != 4:
+        network = addressing.client_network(str(value)) if ipv6 else ipaddress.ip_network(str(value), strict=False)
+        if network.version != 4 and not ipv6:
             raise ValueError(f"{name}.allowed_client_cidrs[{index}] must be IPv4")
         if network.prefixlen == 0:
             raise ValueError(f"iponly access must not allow an open /0 network ({name})")
@@ -240,6 +253,15 @@ def upstream_credentials(upstream: dict[str, Any], name: str) -> tuple[str | Non
 
 
 def validate(data: dict[str, Any]) -> None:
+    if "schema_version" in data:
+        schema_v2.validate(data)
+    else:
+        if (tls_server_config(data) or {}).get("mode") == "acme":
+            raise ValueError("mode acme requires schema_version: 2 and tls.certificates; legacy profiles use acme_ip")
+        validate_legacy(data)
+
+
+def validate_legacy(data: dict[str, Any], *, ipv6_access: bool = False) -> None:
     if "instance" in data:
         identity(data)
     install = data.get("install")
@@ -283,7 +305,7 @@ def validate(data: dict[str, Any]) -> None:
         if not isinstance(tls_server, dict):
             raise ValueError("tls.server must be a mapping")
         validate_tls_server(tls_server)
-        if tls_server.get("mode") == "acme_ip" and "instance" not in data:
+        if tls_server.get("mode") in {"acme_ip", "acme"} and "instance" not in data:
             raise ValueError("ACME requires a named instance.id")
 
     logging = data.get("logging", {})
@@ -300,7 +322,7 @@ def validate(data: dict[str, Any]) -> None:
         raise ValueError("logging.compress must be boolean")
 
     access = data.get("access", {})
-    validate_access(access, "access")
+    validate_access(access, "access", ipv6=ipv6_access)
 
     upstreams = data.get("upstreams", {})
     if not isinstance(upstreams, dict):
@@ -379,6 +401,7 @@ def validate(data: dict[str, Any]) -> None:
         validate_access(
             effective_listener_access(data, item),
             f"listener {listener_id}.access",
+            ipv6=ipv6_access,
         )
         protocol = item.get("protocol")
         if protocol not in SUPPORTED_LISTENER_PROTOCOLS:
@@ -431,17 +454,22 @@ def config_token(value: str) -> str:
     return escaped
 
 
-def parent_line(data: dict[str, Any], name: str) -> str:
+def parent_line(data: dict[str, Any], name: str, resolved_upstreams: dict[str, str] | None = None) -> str:
     upstream = data["upstreams"][name]
     parent_type = {"socks5": "socks5", "http": "connect+", "https": "connect+s"}[upstream["type"]]
     username, password = upstream_credentials(upstream, name)
-    fields: list[Any] = ["parent", 1000, parent_type, upstream["host"], upstream["port"]]
+    host = upstream["host"]
+    if schema_v2.enabled(data):
+        if resolved_upstreams is None or name not in resolved_upstreams:
+            raise ValueError("schema 2 renderer requires a resolved upstream snapshot")
+        host = addressing.literal(resolved_upstreams[name])
+    fields: list[Any] = ["parent", 1000, parent_type, host, upstream["port"]]
     if username is not None:
         fields.extend([config_token(username), config_token(password)])
     return " ".join(str(field) for field in fields)
 
 
-def render_3proxy(data: dict[str, Any]) -> str:
+def render_3proxy(data: dict[str, Any], resolved_upstreams: dict[str, str] | None = None) -> str:
     instance_paths = paths(identity(data, legacy="instance" not in data))
     local_auth = data.get("local_auth", {})
     user = local_auth.get("username")
@@ -450,7 +478,7 @@ def render_3proxy(data: dict[str, Any]) -> str:
         effective_listener_access(data, listener).get("mode", "strong") == "strong"
         for listener in data["listeners"]
     )
-    public_ip = data["server"]["public_ip"]
+    public_ip = data["server"].get("public_ip", data["server"].get("udp_public_ip"))
     logging = data.get("logging", {})
     keep_files = logging.get("keep_files", 14)
     lines = [
@@ -467,7 +495,7 @@ def render_3proxy(data: dict[str, Any]) -> str:
         *([f"users {config_token(f'{user}:CL:{password}')}"] if strong_listener_present else []),
         "",
     ]
-    if has_https_listener(data):
+    if has_https_listener(data) and not schema_v2.enabled(data):
         lines.extend([
             "# Managed TLS server settings for HTTPS listeners",
             f"ssl_server_cert {instance_paths['CONFIG_DIR']}/tls/server.crt",
@@ -487,7 +515,7 @@ def render_3proxy(data: dict[str, Any]) -> str:
             "ssl_client_min_proto_version TLSv1.2",
             "",
         ])
-    for listener in sorted(data["listeners"], key=lambda item: item["port"]):
+    for listener in sorted(schema_v2.expanded_listeners(data), key=lambda item: item["port"]):
         lines.append(f"# {listener['id']}")
         access = effective_listener_access(data, listener)
         mode = access.get("mode", "strong")
@@ -497,11 +525,19 @@ def render_3proxy(data: dict[str, Any]) -> str:
             and data["upstreams"][listener["parent"]]["type"] == "https"
         )
         route = (
-            parent_line(data, listener["parent"])
+            parent_line(data, listener["parent"], resolved_upstreams)
             if listener["parent"] != "direct"
             else None
         )
         if secure_listener:
+            if schema_v2.enabled(data):
+                cert_dir = schema_v2.certificate_directory(data, instance_paths["CONFIG_DIR"], listener["tls_certificate"])
+                lines.extend([
+                    f"ssl_server_cert {cert_dir.as_posix()}/server.crt",
+                    f"ssl_server_key {cert_dir.as_posix()}/server.key",
+                    "ssl_server_min_proto_version TLSv1.2",
+                    "ssl_server_no_verify",
+                ])
             lines.append("ssl_serv")
         if secure_parent:
             lines.append("ssl_cli")
@@ -516,19 +552,34 @@ def render_3proxy(data: dict[str, Any]) -> str:
             lines.append("auth iponly")
             if listener["protocol"] == "socks5" and "udp" not in listener["capabilities"]:
                 lines.append("deny * * * * UDPASSOC")
-            for cidr in access["allowed_client_cidrs"]:
+            cidrs = access["allowed_client_cidrs"]
+            if schema_v2.enabled(data):
+                cidrs = [str(addressing.client_network(value)) for value in cidrs]
+            if schema_v2.enabled(data) and listener["listen_ip"] == "::":
+                # 3proxy matches source address families literally. Admit only
+                # explicitly allowed IPv4 ranges in their mapped form, then stop
+                # broader native IPv6 ACLs from implicitly granting IPv4 access.
+                for cidr in cidrs:
+                    network = ipaddress.ip_network(cidr)
+                    if network.version == 4:
+                        lines.append(f"allow * {addressing.mapped_client_network(network)}")
+                        if route is not None: lines.append(route)
+                lines.append("deny * ::ffff:0:0/96")
+                cidrs = [cidr for cidr in cidrs if ipaddress.ip_network(cidr).version == 6]
+            for cidr in cidrs:
                 lines.append(f"allow * {cidr}")
                 if route is not None:
                     lines.append(route)
             lines.append("deny *")
-        bind_ip = listener_ip(data, listener)
+        bind_ip = listener["listen_ip"] if schema_v2.enabled(data) else listener_ip(data, listener)
+        family_flag = " " + addressing.OUTBOUND_FLAGS[listener.get("outbound", {}).get("family", "ipv4")] if schema_v2.enabled(data) else ""
         if listener["protocol"] == "socks5":
             # A loopback UDP socket must advertise an address reachable on loopback.
             relay_ip = bind_ip if ipaddress.ip_address(bind_ip).is_loopback else public_ip
             nat = f" -Ni{relay_ip}" if "udp" in listener["capabilities"] else ""
-            lines.append(f"socks -i{bind_ip} -p{listener['port']}{nat}")
+            lines.append(f"socks -i{bind_ip} -p{listener['port']}{nat}{family_flag}")
         else:
-            lines.append(f"proxy -i{bind_ip} -p{listener['port']}")
+            lines.append(f"proxy -i{bind_ip} -p{listener['port']}{family_flag}")
         if secure_listener:
             lines.append("ssl_noserv")
         if secure_parent:
@@ -537,16 +588,24 @@ def render_3proxy(data: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def render_openssl(data: dict[str, Any]) -> str:
+def render_openssl(data: dict[str, Any], certificate_id: str | None = None) -> str:
     validate(data)
-    server_tls = tls_server_config(data)
-    if server_tls is None:
-        raise ValueError("tls.server is required to render the managed leaf certificate")
-    alt_names = [f"IP.1 = {data['server']['public_ip']}"]
-    alt_names.extend(
-        f"DNS.{index} = {name}"
-        for index, name in enumerate(server_tls["dns_names"], 1)
-    )
+    if schema_v2.enabled(data):
+        certs = schema_v2.certificates(data)
+        if certificate_id is None and len(certs) == 1:
+            certificate_id = next(iter(certs))
+        if certificate_id not in certs:
+            raise ValueError("select a known --certificate-id")
+        requested = schema_v2.certificate_identities(data, certificate_id)
+        alt_names = []
+        for kind, label in (("ip", "IP"), ("dns", "DNS")):
+            alt_names.extend(f"{label}.{index} = {item.value}" for index, item in enumerate((i for i in requested if i.kind == kind), 1))
+    else:
+        server_tls = tls_server_config(data)
+        if server_tls is None:
+            raise ValueError("tls.server is required to render the managed leaf certificate")
+        alt_names = [f"IP.1 = {data['server']['public_ip']}"]
+        alt_names.extend(f"DNS.{index} = {name}" for index, name in enumerate(server_tls["dns_names"], 1))
     return "\n".join([
         "[req]",
         "distinguished_name = req_distinguished_name",
@@ -608,6 +667,8 @@ def main() -> int:
             item.add_argument("--path", required=True)
         if name in {"render-3proxy", "render-openssl"}:
             item.add_argument("--output", type=Path, required=True)
+        if name == "render-openssl":
+            item.add_argument("--certificate-id")
     systemd = sub.add_parser("render-systemd")
     systemd.add_argument("--output", type=Path, required=True)
     systemd.add_argument("--config", type=Path)
@@ -632,23 +693,28 @@ def main() -> int:
         value = scalar(data, args.path)
         print(str(value).lower() if isinstance(value, bool) else value)
     elif args.command == "render-3proxy":
-        write_text(args.output, render_3proxy(data))
+        resolved = None
+        if schema_v2.enabled(data) and data.get("upstreams"):
+            import upstream_resolution
+            snapshot = Path(paths(data["instance"]["id"])["INSTANCE_STATE"]) / "upstreams.pending.json"
+            resolved = upstream_resolution.load(snapshot, data)
+        write_text(args.output, render_3proxy(data, resolved))
     elif args.command == "render-openssl":
-        write_text(args.output, render_openssl(data))
+        write_text(args.output, render_openssl(data, args.certificate_id))
     elif args.command == "render-systemd":
         write_text(args.output, render_systemd(load_config(args.config) if args.config else None))
     elif args.command == "ports":
         for item in sorted(data["listeners"], key=lambda value: value["port"]):
             print(item["port"])
     elif args.command == "firewall-ports":
-        for item in sorted(data["listeners"], key=lambda value: value["port"]):
+        for item in sorted(schema_v2.expanded_listeners(data), key=lambda value: value["port"]):
             if not ipaddress.ip_address(listener_ip(data, item)).is_loopback:
                 print(item["port"])
     elif args.command == "external-udp":
         print(str(any(
             "udp" in item["capabilities"]
             and not ipaddress.ip_address(listener_ip(data, item)).is_loopback
-            for item in data["listeners"]
+            for item in schema_v2.expanded_listeners(data)
         )).lower())
     elif args.command == "has-https-listener":
         print(str(has_https_listener(data)).lower())

@@ -7,6 +7,7 @@ config*.yaml
 !config.matrix.example.yaml
 !config.external-tls.example.yaml
 !config.acme.example.yaml
+!config.dualstack.example.yaml
 .env
 .env.*
 !.env.example
@@ -20,6 +21,9 @@ healthchecks/
 venv/
 .venv/
 __pycache__/
+.test-work/
+tmp/
+.credentials-*
 *.py[cod]
 
 # Editor and OS metadata

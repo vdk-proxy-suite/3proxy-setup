@@ -12,6 +12,7 @@ import subprocess
 import tempfile
 
 import config as config_tool
+import addressing
 from instance import guard
 
 SYSTEM_CA = "/etc/ssl/certs/ca-certificates.crt"
@@ -37,7 +38,9 @@ def openssl(*args: str) -> str:
     return result.stdout
 
 
-def validate_bundle(bundle: dict[str, bytes], public_ip: str, *, minimum_seconds: int = 86400) -> None:
+def validate_bundle(bundle: dict[str, bytes], public_ip: str | list[str], *,
+                    minimum_seconds: int = 86400, exact_sans: bool = False) -> None:
+    required = addressing.identities(public_ip if isinstance(public_ip, list) else [public_ip])
     chain = bundle["server.crt"]
     certs = CERTIFICATE.findall(chain)
     if not certs or CERTIFICATE.sub(b"", chain).strip():
@@ -52,8 +55,12 @@ def validate_bundle(bundle: dict[str, bytes], public_ip: str, *, minimum_seconds
         leaf.write_bytes(certs[0])
         trust = str(root / "trust.crt") if "trust.crt" in bundle else SYSTEM_CA
         openssl("x509", "-in", str(leaf), "-noout", "-checkend", str(minimum_seconds))
-        openssl("verify", "-purpose", "sslserver", "-verify_ip", public_ip,
-                "-CAfile", trust, "-untrusted", str(root / "server.crt"), str(leaf))
+        actual = addressing.normalized_sans(ssl._ssl._test_decode_cert(str(leaf)).get("subjectAltName", ()))
+        if not set(required) <= actual or (exact_sans and set(required) != actual):
+            raise ValueError("certificate SAN identities do not match requested identifiers")
+        for requested in required:
+            openssl("verify", "-purpose", "sslserver", *requested.verify_args(),
+                    "-CAfile", trust, "-untrusted", str(root / "server.crt"), str(leaf))
         context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         context.minimum_version = ssl.TLSVersion.TLSv1_2
         try:

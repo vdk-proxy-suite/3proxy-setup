@@ -127,6 +127,21 @@ class ExternalMaterialTests(unittest.TestCase):
             self.assertEqual((root / "instance-a" / "tls" / "server.key").stat().st_mode & 0o777, 0o600)
             self.assertFalse((root / "instance-a" / "tls" / "ca.key").exists())
 
+    def test_dns_and_dual_ip_sans_are_independent_of_transport(self):
+        ext = self.root / "dual.ext"
+        ext.write_text("basicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature,keyEncipherment\n"
+                       "extendedKeyUsage=serverAuth\nsubjectAltName=DNS:proxy.example.test,IP:127.0.0.1,IP:::1\n")
+        self.run_ssl("x509", "-req", "-in", "leaf.csr", "-CA", "inter.crt", "-CAkey", "inter.key",
+                     "-CAcreateserial", "-days", "3", "-extfile", "dual.ext", "-out", "dual.crt")
+        bundle = dict(self.bundle, **{"server.crt": (self.root / "dual.crt").read_bytes() + (self.root / "inter.crt").read_bytes()})
+        for name in ["proxy.example.test", "127.0.0.1", "0:0:0:0:0:0:0:1"]:
+            tls.validate_bundle(bundle, name)
+        tls.validate_bundle(bundle, ["::1", "127.0.0.1", "PROXY.example.test"], exact_sans=True)
+        for names, exact in [(["wrong.example.test"], False), (["::2"], False),
+                             (["proxy.example.test"], True), (["::1", "127.0.0.1"], True)]:
+            with self.subTest(names=names), self.assertRaisesRegex(ValueError, "SAN"):
+                tls.validate_bundle(bundle, names, exact_sans=exact)
+
     def test_failed_directory_swap_restores_previous_material(self):
         with tempfile.TemporaryDirectory() as name:
             dest = Path(name) / "tls"

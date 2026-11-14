@@ -10,13 +10,24 @@ import zipfile
 
 
 EXECUTABLE_NAMES = {"setup3proxy.sh", "clean3proxy.sh"}
+RELEASE_DIRECTORIES = {"lib", "steps", "tools", "patches", "tests", "docs", "examples"}
+RELEASE_ROOT_FILES = {".gitattributes", ".gitignore", ".env.example", "README.md", "VERSION", *EXECUTABLE_NAMES}
 EXCLUDED_NAMES = {
     ".3proxy-instance.json", "AGENTS.md", "__pycache__", ".git", ".agents", ".idea", ".vscode",
-    ".DS_Store", "Thumbs.db", "healthchecks", "venv", ".venv",
+    ".DS_Store", "Thumbs.db", "healthchecks", "venv", ".venv", ".test-work", "tmp",
 }
 
 
 def excluded(path: Path) -> bool:
+    if len(path.parts) == 1:
+        if path.name not in RELEASE_ROOT_FILES and not (path.name.startswith("config.") and path.name.endswith(".example.yaml")):
+            # The historical primary example has no second component before .example.
+            if path.name != "config.example.yaml":
+                return True
+    elif path.parts[0] not in RELEASE_DIRECTORIES:
+        return True
+    if path.name.startswith(".credentials-"):
+        return True
     if path.name != ".env.example" and (path.name == ".env" or path.name.startswith(".env.")):
         return True
     if any(part in EXCLUDED_NAMES for part in path.parts) or path.suffix.lower() in {
@@ -42,6 +53,8 @@ def main() -> int:
     args = parser.parse_args()
     source = args.source.resolve()
     files = sorted(path for path in source.rglob("*") if path.is_file() and not excluded(path.relative_to(source)))
+    if any(path.is_symlink() for path in files):
+        raise ValueError("release inputs must not be symlinks")
     with zipfile.ZipFile(args.output, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9) as archive:
         for path in files:
             relative = path.relative_to(source)
